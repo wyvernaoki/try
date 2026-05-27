@@ -1,0 +1,4020 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_Fingerprint.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+#include <time.h>
+
+// ============= YOUR WIFI NETWORK CREDENTIALS =============
+// CHANGE THESE TO YOUR ACTUAL WIFI NETWORK
+const char* ssid = "GLOBE-GARCIA FAM";        // Replace with your WiFi name
+const char* password = "PresumptousDisosteira_1121"; // Replace with your WiFi password
+
+// ============= TIMEZONE CONFIGURATION =============
+const long utcOffsetInSeconds = 28800; // UTC+8 for Philippines (8 hours * 3600 seconds)
+
+// ============= WEBSERVER =============
+WebServer server(80);
+
+// ============= HARDWARE =============
+HardwareSerial fingerSerial(2);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+RTC_DS3231 rtc;
+
+// ============= TIME CONFIGURATION =============
+struct TimeConfig {
+  int startHour;
+  int startMinute;
+  int endHour;
+  int endMinute;
+  int gracePeriod; // minutes
+  bool autoDetect; // automatically detect based on time of day
+};
+
+// Default time configuration
+TimeConfig timeConfig = {
+  8, 0,  // Start time: 8:00 AM
+  17, 0, // End time: 5:00 PM
+  15,    // Grace period: 15 minutes
+  true   // Auto-detect Time In/Out based on time of day
+};
+
+// ============= DATA STRUCTURES =============
+struct Student {
+  int id;
+  char name[20];
+  char grade[5];
+  char section[9];  // 8 characters + null terminator
+  bool isRegistered;
+};
+
+// Location options - UPDATED with requested changes
+const char* locationNames[] = {
+  "Admission Office",  // Changed from "Admin Office"
+  "Registrar",
+  "CR",
+  "Cashier",
+  "Canteen",
+  "Library",
+  "Clinic",
+  "Guidance Office"    // Added Guidance Office
+};
+
+// Update location count constant
+const int LOCATION_COUNT = 8;  // Increased from 7 to 8
+
+// Attendance remark types
+const char* remarkTypes[] = {
+  "On Time",
+  "Late",
+  "Early",
+  "Overtime",
+  "Normal"
+};
+
+struct Attendance {
+  int studentId;
+  char timeIn[12];  // Increased to 12 for AM/PM format
+  char timeOut[12]; // Increased to 12 for AM/PM format
+  char date[11];
+  int location;
+  bool isActive;
+  int remark; // 0=On Time, 1=Late, 2=Early, 3=Overtime, 4=Normal (for time out)
+  int duration; // duration in minutes
+};
+
+// ============= CONSTANTS =============
+const int MAX_STUDENTS = 50;
+const int MAX_ATTENDANCE = 200;
+const int EEPROM_SIZE = 4096;
+const int MAX_FINGERPRINT_CAPACITY = 162; // R307 sensor max capacity
+
+// Memory layout
+const int STUDENT_COUNT_ADDR = 0;
+const int STUDENT_DATA_START = 4;
+const int STUDENT_RECORD_SIZE = 40;
+const int MAX_STUDENT_MEMORY = STUDENT_RECORD_SIZE * MAX_STUDENTS;
+
+const int ATTENDANCE_COUNT_ADDR = STUDENT_DATA_START + MAX_STUDENT_MEMORY;
+const int ATTENDANCE_DATA_START = ATTENDANCE_COUNT_ADDR + 4;
+const int ATTENDANCE_RECORD_SIZE = 48; // Increased to accommodate larger time strings
+const int MAX_ATTENDANCE_MEMORY = ATTENDANCE_RECORD_SIZE * MAX_ATTENDANCE;
+
+const int TIME_CONFIG_ADDR = ATTENDANCE_DATA_START + MAX_ATTENDANCE_MEMORY;
+
+// ============= OPTIMIZATION CONSTANTS =============
+const int SCAN_INTERVAL_MS = 50;
+const int LCD_UPDATE_INTERVAL = 2000;
+const int WEBSERVER_PROCESS_INTERVAL = 5;
+
+// ============= GLOBAL VARIABLES =============
+Student students[MAX_STUDENTS];
+Attendance attendanceRecords[MAX_ATTENDANCE];
+int studentCount = 0;
+int attendanceCount = 0;
+String currentScanResult = "";
+bool fingerprintMode = false;
+bool registrationMode = false;
+unsigned long lastScanCheck = 0;
+unsigned long lastLCDUpdate = 0;
+String pendingName = "";
+String pendingGrade = "";
+String pendingSection = "";
+int pendingId = 0;
+int registrationStep = 1;  // Start at step 1
+unsigned long registrationStartTime = 0;
+int selectedLocation = 0;
+int lastSuccessId = 0;
+
+// Cache for quick lookup
+int fingerprintToStudentId[200] = {0};
+int studentIdToIndex[201] = {0};
+
+// ============= FUNCTION DECLARATIONS =============
+void showMainMenu();
+void setupWebServer();
+void loadStudents();
+void loadAttendance();
+void loadTimeConfig();
+void saveStudents();
+void saveAttendance();
+void saveTimeConfig();
+void buildFingerprintCache();
+void rebuildStudentCache();
+int getNextAvailableId();
+Student* findStudentById(int id);
+bool isCheckedInToday(int studentId);
+void recordAttendance(int studentId, bool isTimeIn, int location);
+String getLocationName(int location);
+String getRemarkText(int remark);
+int calculateRemark(DateTime scanTime, bool isTimeIn);
+int calculateDuration(const char* timeIn, const char* timeOut);
+void quickScan();
+void handleRegistration();
+void resetRegistration();
+void checkSensorMemory();
+void checkSensorCapacity();
+String getErrorMessage(uint8_t errorCode);
+void migrateEEPROM();
+void forceResetEEPROM();
+bool validateAndFixRTC();
+bool syncTimeWithNTP();
+void setManualTime(int year, int month, int day, int hour, int minute, int second);
+void checkRTC();
+void safeTimeFormat(char* buffer, int hour, int minute, int second);
+void safeDateFormat(char* buffer, int year, int month, int day);
+
+// ============= HTML PAGE =============
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CFSI Monitoring System</title>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700;800&display=swap');
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body { 
+            font-family: 'Poppins', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            margin: 0; 
+            padding: 20px; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        
+        .container { 
+            max-width: 1300px; 
+            margin: 0 auto; 
+            background: white; 
+            padding: 30px; 
+            border-radius: 20px; 
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3); 
+        }
+        
+        h1 { 
+            text-align: center; 
+            margin-bottom: 30px;
+            padding-bottom: 15px;
+            font-size: 2.8em;
+            font-weight: 800;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            background: linear-gradient(135deg, #667eea, #764ba2, #ff6b6b, #4ecdc4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: 2px 4px 10px rgba(0,0,0,0.2);
+            position: relative;
+            animation: titleGlow 3s ease-in-out infinite;
+        }
+        
+        @keyframes titleGlow {
+            0%, 100% {
+                filter: drop-shadow(0 0 5px rgba(102,126,234,0.5));
+            }
+            50% {
+                filter: drop-shadow(0 0 20px rgba(118,75,162,0.8));
+            }
+        }
+        
+        h1::before {
+            content: "馃攼 ";
+            font-size: 1.2em;
+            background: linear-gradient(135deg, #ff6b6b, #4ecdc4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        h1::after {
+            content: " 馃搳";
+            font-size: 1.2em;
+            background: linear-gradient(135deg, #4ecdc4, #ff6b6b);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .stats { 
+            display: grid; 
+            grid-template-columns: repeat(4, 1fr); 
+            gap: 20px; 
+            margin: 30px 0; 
+        }
+        
+        .stat-card { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white; 
+            padding: 20px; 
+            border-radius: 15px; 
+            text-align: center;
+            box-shadow: 0 10px 20px rgba(102,126,234,0.3);
+            transition: transform 0.3s, box-shadow 0.3s;
+            cursor: pointer;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 30px rgba(102,126,234,0.5);
+        }
+        
+        .stat-number { 
+            font-size: 2.5em; 
+            font-weight: bold; 
+            margin-bottom: 5px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        
+        .stat-label {
+            font-size: 1em;
+            opacity: 0.9;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .menu {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            margin: 30px 0;
+        }
+        
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 15px 10px;
+            border-radius: 10px;
+            font-size: 1em;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        
+        .btn:hover {
+            background: #764ba2;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(102,126,234,0.4);
+        }
+        
+        .btn-danger {
+            background: #e74c3c;
+        }
+        
+        .btn-danger:hover {
+            background: #c0392b;
+        }
+        
+        .btn-success {
+            background: #27ae60;
+        }
+        
+        .btn-success:hover {
+            background: #219a52;
+        }
+        
+        .btn-warning {
+            background: #f39c12;
+        }
+        
+        .btn-warning:hover {
+            background: #e67e22;
+        }
+        
+        .btn-reset {
+            background: #e74c3c;
+            font-weight: bold;
+            border: 2px solid #c0392b;
+        }
+        
+        .location-selector {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            margin: 20px 0;
+        }
+        
+        .location-btn {
+            background: #f8f9fa;
+            border: 2px solid #dee2e6;
+            padding: 15px 10px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 500;
+            text-align: center;
+        }
+        
+        .location-btn:hover {
+            background: #e9ecef;
+            border-color: #adb5bd;
+        }
+        
+        .location-btn.selected {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+            box-shadow: 0 4px 10px rgba(102,126,234,0.3);
+        }
+        
+        .scan-area {
+            background: #f8f9fa;
+            padding: 40px 30px;
+            border-radius: 15px;
+            text-align: center;
+            margin: 30px 0;
+            border: 3px dashed #667eea;
+        }
+        
+        .fingerprint-icon {
+            font-size: 5em;
+            color: #667eea;
+            animation: pulse 2s infinite;
+            margin-bottom: 20px;
+        }
+        
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.8; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        
+        /* Table Styles */
+        .table-container {
+            overflow-x: auto;
+            margin: 25px 0;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            font-size: 0.95em;
+            table-layout: fixed;
+        }
+        
+        th {
+            background: #667eea;
+            color: white;
+            padding: 15px 8px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-size: 0.85em;
+        }
+        
+        th:first-child {
+            border-top-left-radius: 12px;
+        }
+        
+        th:last-child {
+            border-top-right-radius: 12px;
+        }
+        
+        td {
+            padding: 12px 6px;
+            border-bottom: 1px solid #e9ecef;
+            color: #495057;
+            vertical-align: middle;
+            word-wrap: break-word;
+        }
+        
+        /* Column-specific alignments */
+        th:nth-child(1), td:nth-child(1) { /* Name Column */
+            text-align: left;
+            width: 20%;
+        }
+        
+        th:nth-child(2), td:nth-child(2) { /* Grade-Section Column */
+            text-align: center;
+            width: 12%;
+        }
+        
+        th:nth-child(3), td:nth-child(3) { /* Location Column */
+            text-align: center;
+            width: 15%;
+        }
+        
+        th:nth-child(4), td:nth-child(4) { /* Time In Column */
+            text-align: center;
+            width: 12%;
+        }
+        
+        th:nth-child(5), td:nth-child(5) { /* Time Out Column */
+            text-align: center;
+            width: 12%;
+        }
+        
+        th:nth-child(6), td:nth-child(6) { /* Remark Column */
+            text-align: center;
+            width: 12%;
+        }
+        
+        tr:hover {
+            background-color: #f8f9fa;
+            transition: background-color 0.2s;
+        }
+        
+        tr:last-child td {
+            border-bottom: none;
+        }
+        
+        .delete-btn {
+            background: #e74c3c;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85em;
+            font-weight: 500;
+            transition: all 0.2s;
+            box-shadow: 0 2px 4px rgba(231,76,60,0.2);
+        }
+        
+        .delete-btn:hover {
+            background: #c0392b;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(231,76,60,0.3);
+        }
+        
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #27ae60;
+            color: white;
+            padding: 15px 25px;
+            border-radius: 10px;
+            animation: slideIn 0.3s ease-out;
+            z-index: 1000;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            font-weight: 500;
+        }
+        
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 50px;
+            height: 50px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            min-width: 80px;
+            text-align: center;
+        }
+        
+        .badge-admission { background: #3498db; color: white; }
+        .badge-registrar { background: #e67e22; color: white; }
+        .badge-cr { background: #27ae60; color: white; }
+        .badge-cashier { background: #9b59b6; color: white; }
+        .badge-canteen { background: #f1c40f; color: #2c3e50; }
+        .badge-library { background: #1abc9c; color: white; }
+        .badge-clinic { background: #e74c3c; color: white; }
+        .badge-guidance { background: #8e44ad; color: white; }
+        
+        .badge-ontime { background: #27ae60; color: white; }
+        .badge-late { background: #e74c3c; color: white; }
+        .badge-early { background: #f39c12; color: white; }
+        .badge-overtime { background: #8e44ad; color: white; }
+        .badge-normal { background: #7f8c8d; color: white; }
+        
+        .badge-active { background: #27ae60; color: white; }
+        .badge-inactive { background: #7f8c8d; color: white; }
+        
+        .filters {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        
+        .filter-btn {
+            padding: 8px 18px;
+            border: 1px solid #dee2e6;
+            background: white;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.9em;
+            font-weight: 500;
+        }
+        
+        .filter-btn:hover {
+            background: #e9ecef;
+            border-color: #adb5bd;
+        }
+        
+        .filter-btn.active {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+            box-shadow: 0 2px 8px rgba(102,126,234,0.3);
+        }
+        
+        /* Time Configuration Panel */
+        .config-panel {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 15px;
+            margin: 20px 0;
+            box-shadow: 0 10px 20px rgba(102,126,234,0.3);
+        }
+        
+        .config-title {
+            font-size: 1.3em;
+            font-weight: 600;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .config-item {
+            background: rgba(255,255,255,0.1);
+            padding: 15px;
+            border-radius: 10px;
+        }
+        
+        .config-label {
+            font-size: 0.9em;
+            opacity: 0.9;
+            margin-bottom: 5px;
+        }
+        
+        .config-value {
+            font-size: 1.2em;
+            font-weight: 600;
+        }
+        
+        .config-input {
+            width: 100%;
+            padding: 10px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            margin-top: 5px;
+        }
+        
+        .config-checkbox {
+            width: 20px;
+            height: 20px;
+            margin-right: 10px;
+        }
+        
+        .debug-panel {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 25px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .capacity-bar {
+            width: 100%;
+            height: 25px;
+            background: #e9ecef;
+            border-radius: 15px;
+            margin: 15px 0;
+            overflow: hidden;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .capacity-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #27ae60, #f39c12, #e74c3c);
+            transition: width 0.3s ease;
+            border-radius: 15px;
+        }
+        
+        .warning-box {
+            background: #fff3cd;
+            border: 1px solid #ffeeba;
+            color: #856404;
+            padding: 15px 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            font-weight: 500;
+        }
+        
+        .weather-info {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #e9ecef;
+            color: #6c757d;
+            font-size: 0.95em;
+        }
+        
+        /* Form input styles */
+        input[type="text"], input[type="number"], input[type="time"], input[type="datetime-local"] {
+            width: 100%;
+            padding: 12px 14px;
+            margin: 8px 0;
+            border: 2px solid #e9ecef;
+            border-radius: 10px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+        
+        input[type="text"]:focus, input[type="number"]:focus, input[type="time"]:focus, input[type="datetime-local"]:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+        }
+        
+        .section-title {
+            font-size: 1.3em;
+            color: #495057;
+            margin: 20px 0 15px 0;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .duration-badge {
+            background: #e9ecef;
+            padding: 3px 8px;
+            border-radius: 15px;
+            font-size: 0.85em;
+            font-weight: 500;
+        }
+        
+        .clickable {
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .clickable:hover {
+            background-color: #f0f0f0;
+        }
+        
+        /* Responsive design */
+        @media (max-width: 1024px) {
+            .stats {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            .menu {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            th, td {
+                padding: 8px 4px;
+                font-size: 0.8em;
+            }
+            
+            .badge {
+                min-width: 60px;
+                padding: 3px 6px;
+                font-size: 0.75em;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 15px;
+            }
+            
+            .stats {
+                grid-template-columns: 1fr;
+            }
+            
+            .menu {
+                grid-template-columns: 1fr;
+            }
+            
+            th, td {
+                padding: 6px 3px;
+                font-size: 0.7em;
+            }
+            
+            .badge {
+                min-width: 50px;
+                padding: 2px 4px;
+                font-size: 0.7em;
+            }
+            
+            .delete-btn {
+                padding: 4px 8px;
+                font-size: 0.7em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>CFSI Monitoring System</h1>
+        
+        <div class="stats">
+            <div class="stat-card" onclick="showFilteredStudents('all')">
+                <div class="stat-number" id="totalStudents">0</div>
+                <div class="stat-label">Total Students</div>
+            </div>
+            <div class="stat-card" onclick="showFilteredStudents('today')">
+                <div class="stat-number" id="todayAttendance">0</div>
+                <div class="stat-label">Today's Attendance</div>
+            </div>
+            <div class="stat-card" onclick="showFilteredStudents('late')">
+                <div class="stat-number" id="lateToday">0</div>
+                <div class="stat-label">Late Today</div>
+            </div>
+            <div class="stat-card" onclick="showFilteredStudents('active')">
+                <div class="stat-number" id="activeNow">0</div>
+                <div class="stat-label">Currently Inside</div>
+            </div>
+        </div>
+        
+        <div class="menu">
+            <button class="btn" onclick="showRegister()"><span>馃摑</span> Register</button>
+            <button class="btn" onclick="showLocationSelector()"><span>馃憜</span> Scan</button>
+            <button class="btn" onclick="showStudents()"><span>馃搵</span> Students</button>
+            <button class="btn" onclick="showAttendance()"><span>馃搳</span> Records</button>
+            <button class="btn" onclick="showReports()"><span>馃搱</span> Reports</button>
+            <button class="btn" onclick="showTimeConfig()"><span>鈿欙笍</span> Time Config</button>
+            <button class="btn" onclick="showDebug()"><span>馃敡</span> Debug</button>
+            <button class="btn" onclick="exportData()"><span>馃摜</span> Export</button>
+        </div>
+        
+        <div id="content"></div>
+        
+        <div class="weather-info">
+            <span>馃尅锔� 30掳C</span>
+            <span>鈽侊笍 Mostly cloudy</span>
+        </div>
+    </div>
+
+    <script>
+        let scanInterval;
+        let registerInterval;
+        let currentFilter = 'all';
+        let selectedLocation = 0;
+        
+        function updateStats() {
+            fetch('/api/stats')
+                .then(r => r.json())
+                .then(d => {
+                    document.getElementById('totalStudents').innerHTML = d.totalStudents;
+                    document.getElementById('todayAttendance').innerHTML = d.todayAttendance;
+                    document.getElementById('lateToday').innerHTML = d.lateToday;
+                    document.getElementById('activeNow').innerHTML = d.activeNow;
+                })
+                .catch(e => console.log('Stats error:', e));
+        }
+        
+        function showTimeConfig() {
+            fetch('/api/time-config')
+                .then(r => r.json())
+                .then(d => {
+                    let startHour = d.startHour.toString().padStart(2,'0');
+                    let startMinute = d.startMinute.toString().padStart(2,'0');
+                    let endHour = d.endHour.toString().padStart(2,'0');
+                    let endMinute = d.endMinute.toString().padStart(2,'0');
+                    
+                    let html = `
+                        <div class="config-panel">
+                            <div class="config-title">鈿欙笍 Time Configuration</div>
+                            <div class="config-grid">
+                                <div class="config-item">
+                                    <div class="config-label">Start Time</div>
+                                    <input type="time" id="startTime" class="config-input" value="${startHour}:${startMinute}">
+                                </div>
+                                <div class="config-item">
+                                    <div class="config-label">End Time</div>
+                                    <input type="time" id="endTime" class="config-input" value="${endHour}:${endMinute}">
+                                </div>
+                                <div class="config-item">
+                                    <div class="config-label">Grace Period (minutes)</div>
+                                    <input type="number" id="gracePeriod" class="config-input" value="${d.gracePeriod}" min="0" max="120">
+                                </div>
+                                <div class="config-item">
+                                    <div class="config-label">
+                                        <input type="checkbox" id="autoDetect" class="config-checkbox" ${d.autoDetect ? 'checked' : ''}>
+                                        Auto-detect Time In/Out
+                                    </div>
+                                    <div style="font-size:0.9em; margin-top:10px; opacity:0.8;">
+                                        When enabled: Before start time = Time In, After end time = Time Out
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap:10px; margin-top:20px;">
+                                <button class="btn btn-success" onclick="saveTimeConfig()" style="flex:1;">Save Configuration</button>
+                                <button class="btn btn-danger" onclick="cancelForm()" style="flex:1;">Cancel</button>
+                            </div>
+                        </div>
+                    `;
+                    document.getElementById('content').innerHTML = html;
+                });
+        }
+        
+        function saveTimeConfig() {
+            let startTime = document.getElementById('startTime').value.split(':');
+            let endTime = document.getElementById('endTime').value.split(':');
+            let gracePeriod = document.getElementById('gracePeriod').value;
+            let autoDetect = document.getElementById('autoDetect').checked;
+            
+            fetch('/api/save-time-config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `startHour=${startTime[0]}&startMinute=${startTime[1]}&endHour=${endTime[0]}&endMinute=${endTime[1]}&gracePeriod=${gracePeriod}&autoDetect=${autoDetect}`
+            })
+            .then(r => r.json())
+            .then(d => {
+                if(d.success) {
+                    showToast('鉁� Time configuration saved');
+                    location.reload();
+                } else {
+                    showToast('鉂� Failed to save', 'error');
+                }
+            });
+        }
+        
+        function exportData() {
+            fetch('/api/export-attendance')
+                .then(r => r.json())
+                .then(d => {
+                    let csv = "Name,Grade-Section,Location,Date,Time In,Time Out,Duration (min),Remark,Status\n";
+                    d.records.forEach(r => {
+                        csv += `"${r.name}","${r.grade}-${r.section}","${r.location}","${r.date}","${r.timeIn}","${r.timeOut || '---'}","${r.duration || 0}","${r.remark}","${r.isActive ? 'Inside' : 'Out'}"\n`;
+                    });
+                    
+                    let blob = new Blob([csv], {type: 'text/csv'});
+                    let url = window.URL.createObjectURL(blob);
+                    let a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'attendance_' + new Date().toISOString().slice(0,10) + '.csv';
+                    a.click();
+                    
+                    showToast('鉁� Data exported to CSV');
+                });
+        }
+        
+        function showDebug() {
+            // Get current time first
+            fetch('/api/current-time')
+                .then(r => r.json())
+                .then(timeData => {
+                    let currentDateTime = timeData.date.replace(/\//g, '-') + 'T' + timeData.hour24.toString().padStart(2,'0') + ':' + timeData.minute.toString().padStart(2,'0');
+                    
+                    document.getElementById('content').innerHTML = `
+                        <div class="scan-area">
+                            <h3>馃敡 Debug Panel</h3>
+                            <button class="btn" onclick="testSensor()" style="margin:5px;">Test Sensor</button>
+                            <button class="btn" onclick="checkCapacity()" style="margin:5px;">Check Capacity</button>
+                            <button class="btn" onclick="checkState()" style="margin:5px;">Check System State</button>
+                            <button class="btn" onclick="checkRTC()" style="margin:5px;">Check RTC Time</button>
+                            <button class="btn" onclick="syncNTP()" style="margin:5px;">Sync with NTP</button>
+                            <button class="btn" onclick="forceTimeSync()" style="margin:5px; background:#3498db;">馃晵 Force Time Sync</button>
+                            <button class="btn" onclick="clearActiveSessions()" style="margin:5px;">Clear Active Sessions</button>
+                            <button class="btn btn-danger" onclick="clearAllData()" style="margin:5px;">Clear ALL Data</button>
+                            <button class="btn btn-warning" onclick="clearFingerprints()" style="margin:5px;">Clear Fingerprints Only</button>
+                            <button class="btn" onclick="listFingerprints()" style="margin:5px;">List Fingerprints</button>
+                            <button class="btn" onclick="checkConsistency()" style="margin:5px;">Check Consistency</button>
+                            <button class="btn" onclick="checkRegistrationState()" style="margin:5px;">Check Registration State</button>
+                            
+                            <h4 style="margin-top:20px;">馃晵 Manual Time Set</h4>
+                            <input type="datetime-local" id="manualDateTime" value="${currentDateTime}" style="width:100%; margin:10px 0;">
+                            <button class="btn btn-success" onclick="setManualTime()" style="width:100%;">Set Manual Time</button>
+                            
+                            <button class="btn btn-reset" onclick="resetEEPROM()" style="margin-top:20px; background:#e74c3c;">鈿狅笍 RESET EEPROM (Factory Reset)</button>
+                            <div id="debugOutput" class="debug-panel">Click a button to test...</div>
+                        </div>
+                    `;
+                });
+        }
+        
+        function forceTimeSync() {
+            document.getElementById('debugOutput').innerHTML = 'Force syncing time with NTP server...';
+            fetch('/api/sync-time')
+                .then(r => r.json())
+                .then(d => {
+                    if(d.success) {
+                        document.getElementById('debugOutput').innerHTML = 
+                            '鉁� ' + d.message + '<br>Date: ' + d.date + '<br>Time: ' + d.time;
+                        showToast('鉁� Time synced: ' + d.time);
+                    } else {
+                        document.getElementById('debugOutput').innerHTML = '鉂� ' + d.message;
+                    }
+                });
+        }
+        
+        function setManualTime() {
+            let dateTimeStr = document.getElementById('manualDateTime').value;
+            if (!dateTimeStr) {
+                showToast('鉂� Please select date and time', 'error');
+                return;
+            }
+            
+            let date = new Date(dateTimeStr);
+            let year = date.getFullYear();
+            let month = date.getMonth() + 1;
+            let day = date.getDate();
+            let hour = date.getHours();
+            let minute = date.getMinutes();
+            let second = 0;
+            
+            fetch('/api/set-time', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `year=${year}&month=${month}&day=${day}&hour=${hour}&minute=${minute}&second=${second}`
+            })
+            .then(r => r.json())
+            .then(d => {
+                if(d.success) {
+                    showToast('鉁� Time set manually');
+                    document.getElementById('debugOutput').innerHTML = '鉁� Time set to: ' + dateTimeStr;
+                } else {
+                    showToast('鉂� Failed to set time', 'error');
+                }
+            });
+        }
+        
+        function clearActiveSessions() {
+            if(confirm('Clear all active sessions? This will force check out all students.')) {
+                fetch('/api/clear-active-sessions')
+                    .then(r => r.json())
+                    .then(d => {
+                        if(d.success) {
+                            showToast('鉁� Active sessions cleared');
+                            document.getElementById('debugOutput').innerHTML = 'Cleared ' + d.cleared + ' active sessions';
+                        }
+                    });
+            }
+        }
+        
+        function checkRTC() {
+            fetch('/api/check-rtc')
+                .then(r => r.json())
+                .then(d => {
+                    let html = '<h4>鈴� RTC Time:</h4>';
+                    html += 'Date: ' + d.date + '<br>';
+                    html += 'Time: ' + d.time + '<br>';
+                    html += 'Valid: ' + (d.valid ? '鉁�' : '鉂�') + '<br>';
+                    html += '<br><small>Philippines Time (UTC+8)</small>';
+                    document.getElementById('debugOutput').innerHTML = html;
+                });
+        }
+        
+        function syncNTP() {
+            document.getElementById('debugOutput').innerHTML = 'Syncing with NTP...';
+            fetch('/api/sync-ntp')
+                .then(r => r.json())
+                .then(d => {
+                    if(d.success) {
+                        document.getElementById('debugOutput').innerHTML = '鉁� ' + d.message + '<br>New time: ' + d.time;
+                    } else {
+                        document.getElementById('debugOutput').innerHTML = '鉂� ' + d.message;
+                    }
+                });
+        }
+        
+        function resetEEPROM() {
+            if(confirm('鈿狅笍鈿狅笍鈿狅笍 THIS WILL DELETE ALL STUDENTS! Are you ABSOLUTELY sure?')) {
+                if(confirm('LAST WARNING! All student data will be lost forever. Continue?')) {
+                    document.getElementById('debugOutput').innerHTML = 'Resetting EEPROM to factory defaults...';
+                    fetch('/api/reset-eeprom')
+                        .then(r => r.json())
+                        .then(d => {
+                            if(d.success) {
+                                document.getElementById('debugOutput').innerHTML = '鉁� ' + d.message;
+                                showToast('鉁� EEPROM reset complete');
+                                updateStats();
+                            } else {
+                                document.getElementById('debugOutput').innerHTML = '鉂� ' + d.message;
+                            }
+                        })
+                        .catch(e => {
+                            document.getElementById('debugOutput').innerHTML = '鉂� Error: ' + e;
+                        });
+                }
+            }
+        }
+        
+        function checkState() {
+            fetch('/api/debug-state')
+                .then(r => r.json())
+                .then(d => {
+                    let html = '<h4>馃搳 System State:</h4>';
+                    html += 'Registration Mode: ' + (d.registrationMode ? '鉁� Active' : '鉂� Inactive') + '<br>';
+                    html += 'Registration Step: ' + d.registrationStep + '<br>';
+                    html += 'Pending ID: ' + d.pendingId + '<br>';
+                    html += 'Last Success ID: ' + d.lastSuccessId + '<br>';
+                    html += 'Student Count: ' + d.studentCount + '<br>';
+                    html += 'Attendance Count: ' + d.attendanceCount + '<br>';
+                    document.getElementById('debugOutput').innerHTML = html;
+                });
+        }
+        
+        function checkCapacity() {
+            fetch('/api/sensor-capacity')
+                .then(r => r.json())
+                .then(d => {
+                    let percent = (d.current / d.max * 100).toFixed(1);
+                    let color = percent < 50 ? '#27ae60' : (percent < 80 ? '#f39c12' : '#e74c3c');
+                    let html = '<h4>馃搳 Sensor Capacity:</h4>';
+                    html += 'Current: ' + d.current + ' / ' + d.max + '<br>';
+                    html += '<div class="capacity-bar"><div class="capacity-fill" style="width:' + percent + '%; background:' + color + ';"></div></div>';
+                    html += 'Used: ' + percent + '%<br>';
+                    if(d.current >= d.max - 10) {
+                        html += '<p style="color:#e74c3c;">鈿狅笍 Sensor almost full! Delete some fingerprints.</p>';
+                    }
+                    document.getElementById('debugOutput').innerHTML = html;
+                });
+        }
+        
+        function checkRegistrationState() {
+            fetch('/api/registration-state')
+                .then(r => r.json())
+                .then(d => {
+                    let html = '<h4>馃搵 Registration State:</h4>';
+                    html += 'Registration Mode: ' + (d.registrationMode ? '鉁� Active' : '鉂� Inactive') + '<br>';
+                    html += 'Registration Step: ' + d.registrationStep + '<br>';
+                    html += 'Pending ID: ' + d.pendingId + '<br>';
+                    html += 'Last Success ID: ' + d.lastSuccessId + '<br>';
+                    document.getElementById('debugOutput').innerHTML = html;
+                });
+        }
+        
+        function testSensor() {
+            document.getElementById('debugOutput').innerHTML = 'Testing sensor...';
+            fetch('/api/test-sensor')
+                .then(r => r.json())
+                .then(d => {
+                    if(d.success) {
+                        document.getElementById('debugOutput').innerHTML = 
+                            '鉁� Sensor OK<br>Templates: ' + d.templates + '<br>Confidence: ' + d.confidence;
+                    } else {
+                        document.getElementById('debugOutput').innerHTML = 
+                            '鉂� ' + d.message;
+                    }
+                })
+                .catch(e => {
+                    document.getElementById('debugOutput').innerHTML = '鉂� Error: ' + e;
+                });
+        }
+        
+        function clearAllData() {
+            if(confirm('鈿狅笍 This will delete ALL students and ALL fingerprints! This cannot be undone!')) {
+                document.getElementById('debugOutput').innerHTML = 'Clearing all data...';
+                fetch('/api/clear-all-data')
+                    .then(r => r.json())
+                    .then(d => {
+                        if(d.success) {
+                            document.getElementById('debugOutput').innerHTML = '鉁� ' + d.message;
+                            showToast('鉁� All data cleared');
+                            updateStats();
+                        } else {
+                            document.getElementById('debugOutput').innerHTML = '鉂� ' + d.message;
+                        }
+                    });
+            }
+        }
+        
+        function clearFingerprints() {
+            if(confirm('Delete ALL fingerprints from sensor? This cannot be undone!')) {
+                document.getElementById('debugOutput').innerHTML = 'Deleting fingerprints...';
+                fetch('/api/clear-fingerprints')
+                    .then(r => r.json())
+                    .then(d => {
+                        if(d.success) {
+                            document.getElementById('debugOutput').innerHTML = '鉁� ' + d.message;
+                            showToast('鉁� Fingerprints cleared');
+                        } else {
+                            document.getElementById('debugOutput').innerHTML = '鉂� ' + d.message;
+                        }
+                        listFingerprints();
+                    });
+            }
+        }
+        
+        function listFingerprints() {
+            fetch('/api/list-fingerprints')
+                .then(r => r.json())
+                .then(d => {
+                    let html = '<h4>馃搵 Stored Fingerprint IDs:</h4>';
+                    if(d.ids && d.ids.length > 0) {
+                        html += '<div class="table-container"><table><tr><th>ID</th><th>In Database</th><th>Action</th></tr>';
+                        d.ids.forEach((id, index) => {
+                            let inDB = d.inDatabase && d.inDatabase[index] ? '鉁�' : '鉂�';
+                            html += '<tr>' +
+                                '<td style="text-align:center;">' + id + '</td>' +
+                                '<td style="text-align:center;">' + inDB + '</td>' +
+                                '<td style="text-align:center;"><button class="delete-btn" onclick="deleteFingerprint(' + id + ')">Delete</button></td>' +
+                                '</tr>';
+                        });
+                        html += '</table></div>';
+                    } else {
+                        html += 'No fingerprints stored in sensor';
+                    }
+                    document.getElementById('debugOutput').innerHTML = html;
+                });
+        }
+        
+        function checkConsistency() {
+            fetch('/api/check-consistency')
+                .then(r => r.json())
+                .then(d => {
+                    let html = '<h4>馃搳 Consistency Check:</h4>';
+                    html += 'Students in database: ' + d.studentsInDB + '<br>';
+                    html += 'Fingerprints in sensor: ' + d.fingerprintsInSensor + '<br>';
+                    html += 'Matching: ' + d.matching + '<br>';
+                    html += 'Orphaned fingerprints: ' + d.orphaned + '<br>';
+                    html += 'Missing in sensor: ' + d.missing + '<br>';
+                    
+                    if(d.orphaned > 0) {
+                        html += '<button class="btn btn-warning" onclick="cleanOrphaned()" style="margin-top:10px;">Clean Orphaned</button>';
+                    }
+                    
+                    document.getElementById('debugOutput').innerHTML = html;
+                });
+        }
+        
+        function cleanOrphaned() {
+            if(confirm('Delete fingerprints that have no matching student?')) {
+                fetch('/api/clean-orphaned')
+                    .then(r => r.json())
+                    .then(d => {
+                        if(d.success) {
+                            showToast('鉁� Orphaned fingerprints cleaned');
+                            checkConsistency();
+                        }
+                    });
+            }
+        }
+        
+        function deleteFingerprint(id) {
+            if(confirm('Delete fingerprint ID ' + id + '?')) {
+                fetch('/api/delete-fingerprint', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'id=' + id
+                })
+                .then(r => r.json())
+                .then(d => {
+                    if(d.success) {
+                        showToast('鉁� ' + d.message);
+                        listFingerprints();
+                    } else {
+                        showToast('鉂� ' + d.message, 'error');
+                    }
+                });
+            }
+        }
+        
+        function showLocationSelector() {
+            fetch('/api/locations')
+                .then(r => r.json())
+                .then(locations => {
+                    let html = `
+                        <div class="scan-area">
+                            <h3>馃搷 Select Location</h3>
+                            <div class="location-selector" id="locationSelector">
+                    `;
+                    
+                    locations.forEach((loc, index) => {
+                        let icon = "馃彚";
+                        if(index === 1) icon = "馃搵";
+                        else if(index === 2) icon = "馃彌锔�";
+                        else if(index === 3) icon = "馃挵";
+                        else if(index === 4) icon = "鈽�";
+                        else if(index === 5) icon = "馃摎";
+                        else if(index === 6) icon = "馃彞";
+                        else if(index === 7) icon = "馃";
+                        
+                        html += `<div class="location-btn" onclick="selectLocation(${index})">${icon} ${loc}</div>`;
+                    });
+                    
+                    html += `
+                            </div>
+                            <p id="selectedLocationDisplay" style="margin:20px 0; font-weight:500;">Selected: Admission Office</p>
+                            <button class="btn btn-success" onclick="startScan()" style="width:100%;">Continue to Scan</button>
+                            <button class="btn btn-danger" onclick="cancelForm()" style="width:100%; margin-top:10px;">Cancel</button>
+                        </div>
+                    `;
+                    document.getElementById('content').innerHTML = html;
+                });
+        }
+        
+        function selectLocation(loc) {
+            selectedLocation = loc;
+            let locationNames = ['Admission Office', 'Registrar', 'CR', 'Cashier', 'Canteen', 'Library', 'Clinic', 'Guidance Office'];
+            document.querySelectorAll('.location-btn').forEach((btn, idx) => {
+                if (idx === loc) {
+                    btn.classList.add('selected');
+                } else {
+                    btn.classList.remove('selected');
+                }
+            });
+            document.getElementById('selectedLocationDisplay').innerHTML = 'Selected: ' + locationNames[loc];
+        }
+        
+        function showRegister() {
+            document.getElementById('content').innerHTML = `
+                <div class="scan-area">
+                    <h3>馃摑 Register New Student</h3>
+                    <input type="text" id="name" placeholder="Full Name" maxlength="19">
+                    <input type="text" id="grade" placeholder="Grade (e.g., 12)" maxlength="4">
+                    <input type="text" id="section" placeholder="Section (e.g., A-123)" maxlength="8">
+                    <button class="btn" onclick="registerStudent()" style="width:100%; margin-top:15px;">Start Registration</button>
+                    <button class="btn btn-danger" onclick="cancelForm()" style="width:100%; margin-top:10px;">Cancel</button>
+                </div>
+            `;
+        }
+        
+        function registerStudent() {
+            let name = document.getElementById('name').value.trim();
+            let grade = document.getElementById('grade').value.trim();
+            let section = document.getElementById('section').value.trim();
+            
+            if(!name || !grade || !section) {
+                showToast('Please fill all fields', 'error');
+                return;
+            }
+            
+            document.getElementById('content').innerHTML = `
+                <div class="scan-area">
+                    <div class="fingerprint-icon">馃憜</div>
+                    <div class="loading"></div>
+                    <h3>Place finger on sensor to register</h3>
+                    <p id="registerStatus" style="margin:15px 0; color:#667eea; font-weight:500;">Waiting for fingerprint...</p>
+                    <p style="color:#6c757d;">Step 1: Place finger</p>
+                    <button class="btn btn-danger" onclick="cancelRegistration()" style="margin-top:20px;">Cancel</button>
+                </div>
+            `;
+            
+            fetch('/api/register-start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `name=${encodeURIComponent(name)}&grade=${encodeURIComponent(grade)}&section=${encodeURIComponent(section)}`
+            })
+            .then(r => r.json())
+            .then(d => {
+                if(d.success) {
+                    registerInterval = setInterval(checkRegistration, 1000);
+                } else {
+                    showToast('鉂� Failed to start registration', 'error');
+                }
+            })
+            .catch(e => {
+                showToast('鉂� Connection error', 'error');
+                console.log(e);
+            });
+        }
+        
+        function checkRegistration() {
+            fetch('/api/register-status')
+                .then(r => r.json())
+                .then(d => {
+                    if(d.status === 'waiting') {
+                        document.getElementById('registerStatus').innerHTML = 'Waiting for finger...';
+                    } else if(d.status === 'scan1') {
+                        document.getElementById('registerStatus').innerHTML = '鉁� First scan complete! Remove finger';
+                    } else if(d.status === 'scan2') {
+                        document.getElementById('registerStatus').innerHTML = 'Place same finger again';
+                    } else if(d.status === 'saving') {
+                        document.getElementById('registerStatus').innerHTML = 'Saving fingerprint...';
+                    } else if(d.status === 'success') {
+                        clearInterval(registerInterval);
+                        document.getElementById('content').innerHTML = `
+                            <div class="scan-area">
+                                <h3 style="color:#27ae60; font-size:1.5em;">鉁� Registration Successful!</h3>
+                                <p style="margin:15px 0; font-size:1.1em;"><strong>Student:</strong> ${d.name}</p>
+                                <p style="margin:10px 0;"><strong>ID:</strong> ${d.id}</p>
+                                <p style="margin:10px 0;"><strong>Grade & Section:</strong> ${d.grade}-${d.section}</p>
+                                <button class="btn" onclick="location.reload()" style="margin-top:15px;">OK</button>
+                            </div>
+                        `;
+                        showToast('鉁� Registered! ID: ' + d.id);
+                        updateStats();
+                    } else if(d.status === 'failed') {
+                        clearInterval(registerInterval);
+                        document.getElementById('content').innerHTML = `
+                            <div class="scan-area">
+                                <h3 style="color:#e74c3c;">鉂� Registration Failed</h3>
+                                <p style="margin:15px 0;">${d.message}</p>
+                                <button class="btn" onclick="showRegister()">Try Again</button>
+                            </div>
+                        `;
+                        showToast('鉂� Registration failed', 'error');
+                    }
+                })
+                .catch(e => console.log('Check error:', e));
+        }
+        
+        function cancelRegistration() {
+            clearInterval(registerInterval);
+            fetch('/api/register-cancel')
+                .then(() => location.reload());
+        }
+        
+        function startScan() {
+            let locationNames = ['Admission Office', 'Registrar', 'CR', 'Cashier', 'Canteen', 'Library', 'Clinic', 'Guidance Office'];
+            document.getElementById('content').innerHTML = `
+                <div class="scan-area">
+                    <div class="fingerprint-icon">馃憜</div>
+                    <h3>Place finger for attendance</h3>
+                    <p style="margin:15px 0; font-weight:500;"><strong>Location:</strong> ${locationNames[selectedLocation]}</p>
+                    <p id="scanStatus" style="color:#667eea; font-weight:500;">Waiting for fingerprint...</p>
+                    <button class="btn btn-danger" onclick="cancelScan()" style="margin-top:20px;">Cancel</button>
+                </div>
+            `;
+            fetch('/api/start-scan?location=' + selectedLocation);
+            scanInterval = setInterval(checkScan, 1000);
+        }
+        
+        function checkScan() {
+            fetch('/api/scan-result')
+                .then(r => r.json())
+                .then(d => {
+                    if(d.scanned) {
+                        document.getElementById('scanStatus').innerHTML = 
+                            `鉁� ${d.name} (${d.grade}-${d.section})<br>${d.type} at ${d.time}<br>馃搷 ${d.location}<br>鈴憋笍 ${d.remark}`;
+                        showToast(`${d.name} - ${d.type} - ${d.remark}`);
+                        updateStats();
+                        setTimeout(() => {
+                            document.getElementById('scanStatus').innerHTML = 'Waiting for fingerprint...';
+                        }, 3000);
+                    }
+                })
+                .catch(e => console.log('Scan error:', e));
+        }
+        
+        function cancelScan() {
+            clearInterval(scanInterval);
+            fetch('/api/cancel-scan')
+                .then(() => location.reload());
+        }
+        
+        function showStudents() {
+            fetch('/api/students')
+                .then(r => r.json())
+                .then(d => {
+                    if(d.students && d.students.length > 0) {
+                        let html = '<div class="section-title">Registered Students</div>';
+                        html += '<div class="table-container">';
+                        html += '<table>';
+                        html += '<tr><th>ID</th><th>Name</th><th>Grade-Section</th><th>Action</th></tr>';
+                        
+                        d.students.forEach(s => {
+                            html += `<tr>
+                                <td style="text-align:center; font-weight:500;">${s.id}</td>
+                                <td style="text-align:left;">${s.name}</td>
+                                <td style="text-align:center;"><span style="background:#e9ecef; padding:4px 12px; border-radius:20px; font-weight:500;">${s.grade}-${s.section}</span></td>
+                                <td style="text-align:center;"><button class="delete-btn" onclick="deleteStudent(${s.id})">Delete</button></td>
+                            </tr>`;
+                        });
+                        
+                        html += '</table>';
+                        html += '</div>';
+                        document.getElementById('content').innerHTML = html;
+                    } else {
+                        document.getElementById('content').innerHTML = '<div class="scan-area"><h3>No students registered yet</h3><p style="margin-top:10px;">Click "Register" to add a new student.</p></div>';
+                    }
+                })
+                .catch(e => {
+                    console.log('Students error:', e);
+                    showToast('鉂� Failed to load students', 'error');
+                });
+        }
+        
+        function showAttendance() {
+            fetch('/api/attendance')
+                .then(r => r.json())
+                .then(d => {
+                    if(d.records && d.records.length > 0) {
+                        let html = '<div class="section-title">Attendance Records</div>';
+                        html += `
+                            <div class="filters">
+                                <button class="filter-btn active" onclick="filterAttendance('all')">All</button>
+                                <button class="filter-btn" onclick="filterAttendance('Admission Office')">馃彚 Admission</button>
+                                <button class="filter-btn" onclick="filterAttendance('Registrar')">馃搵 Registrar</button>
+                                <button class="filter-btn" onclick="filterAttendance('CR')">馃彌锔� CR</button>
+                                <button class="filter-btn" onclick="filterAttendance('Cashier')">馃挵 Cashier</button>
+                                <button class="filter-btn" onclick="filterAttendance('Canteen')">鈽� Canteen</button>
+                                <button class="filter-btn" onclick="filterAttendance('Library')">馃摎 Library</button>
+                                <button class="filter-btn" onclick="filterAttendance('Clinic')">馃彞 Clinic</button>
+                                <button class="filter-btn" onclick="filterAttendance('Guidance Office')">馃 Guidance</button>
+                                <button class="filter-btn" onclick="filterAttendance('late')">鈴� Late</button>
+                                <button class="filter-btn" onclick="filterAttendance('ontime')">鉁� On Time</button>
+                                <button class="filter-btn" onclick="filterAttendance('early')">馃攩 Early</button>
+                            </div>
+                            <div class="table-container">
+                            <table id="attendanceTable">
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>Grade-Sec</th>
+                                        <th>Location</th>
+                                        <th>Date</th>
+                                        <th>Time In</th>
+                                        <th>Time Out</th>
+                                        <th>Duration</th>
+                                        <th>Remark</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                        `;
+                        
+                        d.records.forEach(r => {
+                            let badgeClass = 'badge-admission';
+                            if(r.location === 'Registrar') badgeClass = 'badge-registrar';
+                            else if(r.location === 'CR') badgeClass = 'badge-cr';
+                            else if(r.location === 'Cashier') badgeClass = 'badge-cashier';
+                            else if(r.location === 'Canteen') badgeClass = 'badge-canteen';
+                            else if(r.location === 'Library') badgeClass = 'badge-library';
+                            else if(r.location === 'Clinic') badgeClass = 'badge-clinic';
+                            else if(r.location === 'Guidance Office') badgeClass = 'badge-guidance';
+                            
+                            let remarkClass = 'badge-normal';
+                            if(r.remark === 'On Time') remarkClass = 'badge-ontime';
+                            else if(r.remark === 'Late') remarkClass = 'badge-late';
+                            else if(r.remark === 'Early') remarkClass = 'badge-early';
+                            else if(r.remark === 'Overtime') remarkClass = 'badge-overtime';
+                            
+                            let statusClass = r.isActive ? 'badge-active' : 'badge-inactive';
+                            let statusText = r.isActive ? 'Inside' : 'Out';
+                            
+                            // Format duration
+                            let durationText = '---';
+                            if (r.duration && r.duration > 0) {
+                                let hours = Math.floor(r.duration / 60);
+                                let minutes = r.duration % 60;
+                                if (hours > 0) {
+                                    durationText = hours + 'h ' + minutes + 'm';
+                                } else {
+                                    durationText = minutes + ' min';
+                                }
+                            }
+                            
+                            html += `<tr class="attendance-row" data-location="${r.location}" data-remark="${r.remark}">
+                                <td style="text-align:left; font-weight:500;">${r.name}</td>
+                                <td style="text-align:center;">${r.grade}-${r.section}</td>
+                                <td style="text-align:center;"><span class="badge ${badgeClass}">${r.location}</span></td>
+                                <td style="text-align:center; font-family:monospace;">${r.date}</td>
+                                <td style="text-align:center; font-family:monospace; font-weight:500;">${r.timeIn}</td>
+                                <td style="text-align:center; font-family:monospace; font-weight:500;">${r.timeOut || '---'}</td>
+                                <td style="text-align:center;"><span class="duration-badge">${durationText}</span></td>
+                                <td style="text-align:center;"><span class="badge ${remarkClass}">${r.remark}</span></td>
+                                <td style="text-align:center;"><span class="badge ${statusClass}">${statusText}</span></td>
+                            </tr>`;
+                        });
+                        
+                        html += '</tbody></table></div>';
+                        document.getElementById('content').innerHTML = html;
+                    } else {
+                        document.getElementById('content').innerHTML = '<div class="scan-area"><h3>No attendance records yet</h3></div>';
+                    }
+                })
+                .catch(e => {
+                    console.log('Attendance error:', e);
+                    showToast('鉂� Failed to load attendance', 'error');
+                });
+        }
+        
+        function filterAttendance(filter) {
+            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            let rows = document.querySelectorAll('.attendance-row');
+            rows.forEach(row => {
+                if(filter === 'all') {
+                    row.style.display = '';
+                } else if(filter === 'late' || filter === 'ontime' || filter === 'early') {
+                    let remark = row.getAttribute('data-remark');
+                    let filterMap = {
+                        'late': 'Late',
+                        'ontime': 'On Time',
+                        'early': 'Early'
+                    };
+                    row.style.display = remark === filterMap[filter] ? '' : 'none';
+                } else {
+                    row.style.display = row.getAttribute('data-location') === filter ? '' : 'none';
+                }
+            });
+        }
+        
+        function showReports() {
+            fetch('/api/attendance-summary')
+                .then(r => r.json())
+                .then(d => {
+                    let html = '<div class="section-title">Attendance Summary</div>';
+                    html += `
+                        <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:15px; margin:20px 0;">
+                            <div class="stat-card" style="background:#3498db; cursor:pointer;" onclick="showFilteredStudents('today')">
+                                <div class="stat-number">${d.totalToday}</div>
+                                <div class="stat-label">Today's Total</div>
+                            </div>
+                            <div class="stat-card" style="background:#e67e22; cursor:pointer;" onclick="showFilteredStudents('active')">
+                                <div class="stat-number">${d.activeNow}</div>
+                                <div class="stat-label">Currently Inside</div>
+                            </div>
+                            <div class="stat-card" style="background:#e74c3c; cursor:pointer;" onclick="showFilteredStudents('late')">
+                                <div class="stat-number">${d.lateToday}</div>
+                                <div class="stat-label">Late Today</div>
+                            </div>
+                            <div class="stat-card" style="background:#27ae60; cursor:pointer;" onclick="showFilteredStudents('ontime')">
+                                <div class="stat-number">${d.ontimeToday}</div>
+                                <div class="stat-label">On Time Today</div>
+                            </div>
+                        </div>
+                        <h4 style="margin:20px 0 10px 0;">馃搷 Location Summary</h4>
+                        <div class="table-container">
+                        <table>
+                            <tr><th>Location</th><th style="text-align:center;">Today</th><th style="text-align:center;">Late</th><th style="text-align:center;">On Time</th></tr>
+                    `;
+                    
+                    for(let loc in d.locationSummary) {
+                        let count = d.locationSummary[loc];
+                        let lateCount = d.locationLate[loc] || 0;
+                        let ontimeCount = d.locationOntime[loc] || 0;
+                        let badgeClass = 'badge-admission';
+                        if(loc === 'Registrar') badgeClass = 'badge-registrar';
+                        else if(loc === 'CR') badgeClass = 'badge-cr';
+                        else if(loc === 'Cashier') badgeClass = 'badge-cashier';
+                        else if(loc === 'Canteen') badgeClass = 'badge-canteen';
+                        else if(loc === 'Library') badgeClass = 'badge-library';
+                        else if(loc === 'Clinic') badgeClass = 'badge-clinic';
+                        else if(loc === 'Guidance Office') badgeClass = 'badge-guidance';
+                        
+                        html += `<tr>
+                            <td><span class="badge ${badgeClass}">${loc}</span></td>
+                            <td style="text-align:center; font-weight:500; cursor:pointer;" onclick="showFilteredStudents('location', '${loc}')">${count}</td>
+                            <td style="text-align:center; color:#e74c3c; font-weight:500; cursor:pointer;" onclick="showFilteredStudents('late', '${loc}')">${lateCount}</td>
+                            <td style="text-align:center; color:#27ae60; font-weight:500; cursor:pointer;" onclick="showFilteredStudents('ontime', '${loc}')">${ontimeCount}</td>
+                        </tr>`;
+                    }
+                    
+                    html += '</table></div>';
+                    document.getElementById('content').innerHTML = html;
+                });
+        }
+        
+        function showFilteredStudents(filter, location = '') {
+            let title = '';
+            let filterType = filter;
+            let filterLocation = location;
+            
+            switch(filter) {
+                case 'all':
+                    title = 'All Students';
+                    break;
+                case 'today':
+                    title = 'All Students Today';
+                    break;
+                case 'active':
+                    title = 'Currently Inside';
+                    break;
+                case 'late':
+                    title = location ? `Late Students - ${location}` : 'Late Students Today';
+                    break;
+                case 'ontime':
+                    title = location ? `On Time Students - ${location}` : 'On Time Students Today';
+                    break;
+                case 'location':
+                    title = `Students at ${location}`;
+                    break;
+            }
+            
+            fetch('/api/filtered-attendance?filter=' + filter + (location ? '&location=' + encodeURIComponent(location) : ''))
+                .then(r => r.json())
+                .then(d => {
+                    if(d.records && d.records.length > 0) {
+                        let html = `<div class="section-title">${title} <span style="font-size:0.7em; background:#e9ecef; padding:5px 10px; border-radius:20px;">${d.records.length} students</span></div>`;
+                        html += '<button class="btn" onclick="showReports()" style="margin-bottom:15px; width:auto;">鈫� Back to Summary</button>';
+                        html += '<div class="table-container">';
+                        html += '<table>';
+                        html += '<tr><th>Name</th><th>Grade-Section</th><th>Location</th><th>Time In</th><th>Time Out</th><th>Remark</th></tr>';
+                        
+                        d.records.forEach(r => {
+                            let badgeClass = 'badge-admission';
+                            if(r.location === 'Registrar') badgeClass = 'badge-registrar';
+                            else if(r.location === 'CR') badgeClass = 'badge-cr';
+                            else if(r.location === 'Cashier') badgeClass = 'badge-cashier';
+                            else if(r.location === 'Canteen') badgeClass = 'badge-canteen';
+                            else if(r.location === 'Library') badgeClass = 'badge-library';
+                            else if(r.location === 'Clinic') badgeClass = 'badge-clinic';
+                            else if(r.location === 'Guidance Office') badgeClass = 'badge-guidance';
+                            
+                            let remarkClass = 'badge-normal';
+                            if(r.remark === 'On Time') remarkClass = 'badge-ontime';
+                            else if(r.remark === 'Late') remarkClass = 'badge-late';
+                            else if(r.remark === 'Early') remarkClass = 'badge-early';
+                            
+                            html += `<tr>
+                                <td style="font-weight:500;">${r.name}</td>
+                                <td style="text-align:center;">${r.grade}-${r.section}</td>
+                                <td style="text-align:center;"><span class="badge ${badgeClass}">${r.location}</span></td>
+                                <td style="text-align:center; font-family:monospace;">${r.timeIn}</td>
+                                <td style="text-align:center; font-family:monospace;">${r.timeOut || '---'}</td>
+                                <td style="text-align:center;"><span class="badge ${remarkClass}">${r.remark}</span></td>
+                            </tr>`;
+                        });
+                        
+                        html += '</table></div>';
+                        document.getElementById('content').innerHTML = html;
+                    } else {
+                        document.getElementById('content').innerHTML = `
+                            <div class="scan-area">
+                                <h3>No students found</h3>
+                                <p style="margin:15px 0;">No records match the selected filter.</p>
+                                <button class="btn" onclick="showReports()">Back to Summary</button>
+                            </div>
+                        `;
+                    }
+                });
+        }
+        
+        function deleteStudent(id) {
+            if(confirm('Delete this student? This will also delete their fingerprint.')) {
+                fetch('/api/delete-student', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: `id=${id}`
+                })
+                .then(r => r.json())
+                .then(d => {
+                    if(d.success) {
+                        showToast('Student deleted');
+                        showStudents();
+                        updateStats();
+                    } else {
+                        showToast('鉂� ' + d.message, 'error');
+                    }
+                })
+                .catch(e => {
+                    showToast('鉂� Delete failed', 'error');
+                    console.log(e);
+                });
+            }
+        }
+        
+        function cancelForm() {
+            location.reload();
+        }
+        
+        function showToast(msg, type='success') {
+            let toast = document.createElement('div');
+            toast.className = 'toast';
+            toast.style.background = type=='success' ? '#27ae60' : '#e74c3c';
+            toast.innerHTML = msg;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }
+        
+        // Initialize
+        setInterval(updateStats, 5000);
+        updateStats();
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// ============= SYNC TIME WITH NTP =============
+bool syncTimeWithNTP() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("馃寪 Syncing time with NTP...");
+    
+    // Configure time with UTC+8 offset for Philippines
+    configTime(utcOffsetInSeconds, 0, "pool.ntp.org", "time.nist.gov", "asia.pool.ntp.org");
+    
+    struct tm timeinfo;
+    int retry = 0;
+    while (!getLocalTime(&timeinfo) && retry < 10) {
+      Serial.print(".");
+      delay(1000);
+      retry++;
+    }
+    
+    if (getLocalTime(&timeinfo)) {
+      // Convert to DateTime and set RTC
+      DateTime ntpTime = DateTime(
+        timeinfo.tm_year + 1900,
+        timeinfo.tm_mon + 1,
+        timeinfo.tm_mday,
+        timeinfo.tm_hour,
+        timeinfo.tm_min,
+        timeinfo.tm_sec
+      );
+      
+      rtc.adjust(ntpTime);
+      Serial.println("\n鉁� RTC synced with NTP (Philippines Time UTC+8)");
+      
+      char timeStr[12];
+      safeTimeFormat(timeStr, ntpTime.hour(), ntpTime.minute(), ntpTime.second());
+      Serial.printf("馃搮 Current time: %04d/%02d/%02d %s\n", 
+                    ntpTime.year(), ntpTime.month(), ntpTime.day(), timeStr);
+      return true;
+    } else {
+      Serial.println("\n鉂� Failed to get NTP time");
+      return false;
+    }
+  }
+  return false;
+}
+
+// ============= SET MANUAL TIME =============
+void setManualTime(int year, int month, int day, int hour, int minute, int second) {
+  DateTime manualTime = DateTime(year, month, day, hour, minute, second);
+  rtc.adjust(manualTime);
+  Serial.println("鉁� Time manually set");
+  
+  char timeStr[12];
+  safeTimeFormat(timeStr, hour, minute, second);
+  Serial.printf("馃搮 New time: %04d/%02d/%02d %s\n", year, month, day, timeStr);
+  
+  lcd.clear();
+  lcd.print("Time Updated!");
+  lcd.setCursor(0, 1);
+  lcd.print(timeStr);
+  delay(2000);
+  
+  lcd.clear();
+  lcd.print("System Ready!");
+  lcd.setCursor(0, 1);
+  lcd.print("Place finger...");
+}
+
+// ============= CHECK RTC TIME =============
+void checkRTC() {
+  if (!rtc.begin()) {
+    Serial.println("鉂� RTC not found!");
+    return;
+  }
+  
+  DateTime now = rtc.now();
+  
+  Serial.println("\n=== RTC TIME CHECK ===");
+  Serial.printf("Raw RTC: %04d-%02d-%02d %02d:%02d:%02d\n", 
+                now.year(), now.month(), now.day(),
+                now.hour(), now.minute(), now.second());
+  
+  // Check if time is in 24-hour format (which it should be)
+  if (now.hour() >= 0 && now.hour() <= 23) {
+    Serial.println("鉁� RTC is in 24-hour format");
+    
+    // Display in 12-hour format for verification
+    int hour12 = now.hour() % 12;
+    if (hour12 == 0) hour12 = 12;
+    const char* ampm = (now.hour() < 12) ? "AM" : "PM";
+    
+    Serial.printf("12-hour format: %02d:%02d:%02d %s\n", 
+                  hour12, now.minute(), now.second(), ampm);
+  } else {
+    Serial.println("鉂� RTC has invalid hour value!");
+  }
+  
+  // Calculate expected time for Philippines (UTC+8)
+  Serial.println("\nTimezone Info:");
+  Serial.println("Philippines is UTC+8");
+  Serial.println("Make sure your RTC is set to Philippines time");
+  Serial.println("========================\n");
+}
+
+// ============= VALIDATE AND FIX RTC =============
+bool validateAndFixRTC() {
+  if (!rtc.begin()) {
+    Serial.println("鉂� RTC not found!");
+    return false;
+  }
+  
+  DateTime now = rtc.now();
+  
+  // Check if RTC has lost power or has invalid time
+  if (rtc.lostPower() || now.year() < 2020 || now.year() > 2030) {
+    Serial.println("鈿狅笍 RTC has invalid date/time! Attempting to sync with NTP...");
+    
+    // Try to sync with NTP first
+    if (WiFi.status() == WL_CONNECTED) {
+      if (syncTimeWithNTP()) {
+        return true;
+      }
+    }
+    
+    // If NTP fails, set to compile time (but this will be in UTC)
+    Serial.println("鈿狅笍 Setting to compile time (may be off by timezone)...");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    
+    // Verify again
+    now = rtc.now();
+    if (now.year() < 2020 || now.year() > 2030) {
+      Serial.println("鉂� RTC still returning invalid data after reset!");
+      return false;
+    }
+    
+    Serial.println("鉁� RTC reset to compile time");
+    return true;
+  }
+  
+  return true;
+}
+
+// ============= SAFE TIME FORMATTING (12-HOUR FORMAT) =============
+void safeTimeFormat(char* buffer, int hour, int minute, int second) {
+  // Clamp values to valid ranges
+  if (hour < 0 || hour > 23) hour = 0;
+  if (minute < 0 || minute > 59) minute = 0;
+  if (second < 0 || second > 59) second = 0;
+  
+  // Convert to 12-hour format
+  int hour12 = hour % 12;
+  if (hour12 == 0) hour12 = 12;
+  const char* ampm = (hour < 12) ? "AM" : "PM";
+  
+  sprintf(buffer, "%02d:%02d:%02d %s", hour12, minute, second, ampm);
+}
+
+// ============= SAFE DATE FORMATTING =============
+void safeDateFormat(char* buffer, int year, int month, int day) {
+  // Clamp values to valid ranges
+  if (year < 2000 || year > 2100) year = 2024;
+  if (month < 1 || month > 12) month = 1;
+  if (day < 1 || day > 31) day = 1;
+  
+  sprintf(buffer, "%04d/%02d/%02d", year, month, day);
+}
+
+// ============= SETUP =============
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n=== CFSI MONITORING SYSTEM ===");
+  
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  
+  // Initialize I2C
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+  lcd.setCursor(0, 1);
+  lcd.print("System Starting");
+  
+  // Connect to WiFi network
+  Serial.print("馃摫 Connecting to WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  // Wait for connection with timeout
+  int wifiTimeout = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 30) {
+    delay(1000);
+    Serial.print(".");
+    wifiTimeout++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n鉁� Connected to WiFi!");
+    IPAddress IP = WiFi.localIP();
+    Serial.print("馃摗 IP Address: ");
+    Serial.println(IP);
+  } else {
+    Serial.println("\n鉂� Failed to connect to WiFi!");
+    // Continue in AP mode as fallback
+    Serial.println("馃摫 Starting AP mode as fallback...");
+    WiFi.softAP("CFSI_Monitoring", "12345678");
+    IPAddress IP = WiFi.softAPIP();
+  }
+  
+  // Initialize fingerprint sensor
+  fingerSerial.begin(57600, SERIAL_8N1, 16, 17);
+  delay(500);
+  
+  finger.begin(57600);
+  
+  lcd.clear();
+  lcd.print("Checking Sensor");
+  
+  if (finger.verifyPassword()) {
+    Serial.println("鉁� Fingerprint sensor detected!");
+    
+    // Get template count
+    finger.getTemplateCount();
+    Serial.print("馃搳 Templates stored: ");
+    Serial.println(finger.templateCount);
+  } else {
+    Serial.println("鉂� Fingerprint sensor NOT found!");
+    Serial.println("鈿狅笍 Check wiring: RX=16, TX=17, VCC=3.3V, GND=GND");
+    lcd.clear();
+    lcd.print("Sensor Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Check Wiring!");
+    delay(3000);
+  }
+  
+  // Initialize RTC
+  Serial.println("\n=== RTC INITIALIZATION ===");
+  if (!rtc.begin()) {
+    Serial.println("鉂� RTC NOT found! Using software time fallback...");
+    Serial.println("鈿狅笍 Dates and times will be incorrect until RTC is fixed");
+  } else {
+    Serial.println("鉁� RTC detected!");
+    
+    // Validate and fix RTC time
+    validateAndFixRTC();
+    
+    // Show current time
+    DateTime now = rtc.now();
+    char timeStr[12];
+    safeTimeFormat(timeStr, now.hour(), now.minute(), now.second());
+    Serial.printf("馃搮 Current RTC time: %04d/%02d/%02d %s\n", 
+                  now.year(), now.month(), now.day(), timeStr);
+  }
+  Serial.println("===========================\n");
+  
+  // After WiFi is connected, try to sync RTC with NTP
+  if (WiFi.status() == WL_CONNECTED) {
+    syncTimeWithNTP();
+  }
+  
+  // Load time configuration
+  loadTimeConfig();
+  
+  // Migrate old EEPROM data if needed
+  migrateEEPROM();
+  
+  // Load data
+  loadStudents();
+  loadAttendance();
+  buildFingerprintCache();
+  rebuildStudentCache();
+  
+  // Setup web server
+  setupWebServer();
+  server.begin();
+  
+  Serial.print("馃搳 Students loaded: ");
+  Serial.println(studentCount);
+  Serial.print("馃搳 Attendance records loaded: ");
+  Serial.println(attendanceCount);
+  
+  // Check sensor memory
+  checkSensorMemory();
+  checkSensorCapacity();
+  checkRTC(); // Additional RTC check
+  
+  // Show "System Ready" on LCD instead of WiFi status
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready!");
+  lcd.setCursor(0, 1);
+  lcd.print("Place finger...");
+  
+  lastLCDUpdate = millis();
+}
+
+// ============= LOAD TIME CONFIGURATION =============
+void loadTimeConfig() {
+  int addr = TIME_CONFIG_ADDR;
+  
+  // Check if configuration exists (first byte is 0xFF if EEPROM is fresh)
+  if (EEPROM.read(addr) == 0xFF) {
+    // Use default values
+    saveTimeConfig();
+    Serial.println("馃搮 Using default time configuration");
+  } else {
+    timeConfig.startHour = EEPROM.read(addr);
+    addr += sizeof(int);
+    timeConfig.startMinute = EEPROM.read(addr);
+    addr += sizeof(int);
+    timeConfig.endHour = EEPROM.read(addr);
+    addr += sizeof(int);
+    timeConfig.endMinute = EEPROM.read(addr);
+    addr += sizeof(int);
+    timeConfig.gracePeriod = EEPROM.read(addr);
+    addr += sizeof(int);
+    timeConfig.autoDetect = EEPROM.read(addr);
+    
+    Serial.println("馃搮 Loaded time configuration:");
+    Serial.printf("   Start: %02d:%02d\n", timeConfig.startHour, timeConfig.startMinute);
+    Serial.printf("   End: %02d:%02d\n", timeConfig.endHour, timeConfig.endMinute);
+    Serial.printf("   Grace: %d minutes\n", timeConfig.gracePeriod);
+    Serial.printf("   Auto-detect: %s\n", timeConfig.autoDetect ? "Yes" : "No");
+  }
+}
+
+// ============= SAVE TIME CONFIGURATION =============
+void saveTimeConfig() {
+  int addr = TIME_CONFIG_ADDR;
+  
+  EEPROM.write(addr, timeConfig.startHour);
+  addr += sizeof(int);
+  EEPROM.write(addr, timeConfig.startMinute);
+  addr += sizeof(int);
+  EEPROM.write(addr, timeConfig.endHour);
+  addr += sizeof(int);
+  EEPROM.write(addr, timeConfig.endMinute);
+  addr += sizeof(int);
+  EEPROM.write(addr, timeConfig.gracePeriod);
+  addr += sizeof(int);
+  EEPROM.write(addr, timeConfig.autoDetect);
+  
+  EEPROM.commit();
+  Serial.println("馃捑 Time configuration saved to EEPROM");
+}
+
+// ============= CALCULATE REMARK =============
+int calculateRemark(DateTime scanTime, bool isTimeIn) {
+  int scanMinutes = scanTime.hour() * 60 + scanTime.minute();
+  int startMinutes = timeConfig.startHour * 60 + timeConfig.startMinute;
+  int endMinutes = timeConfig.endHour * 60 + timeConfig.endMinute;
+  
+  if (isTimeIn) {
+    // Time In remarks
+    if (scanMinutes <= startMinutes + timeConfig.gracePeriod) {
+      return 0; // On Time (before or during grace period)
+    } else {
+      return 1; // Late
+    }
+  } else {
+    // Time Out remarks
+    if (scanMinutes >= endMinutes - timeConfig.gracePeriod) {
+      return 0; // On Time (after or during grace period before end)
+    } else {
+      return 2; // Early
+    }
+  }
+}
+
+// ============= CALCULATE DURATION =============
+int calculateDuration(const char* timeIn, const char* timeOut) {
+  if (strlen(timeIn) == 0 || strlen(timeOut) == 0) {
+    return 0;
+  }
+  
+  int inHour, inMin, inSec;
+  int outHour, outMin, outSec;
+  char inAmpm[3], outAmpm[3];
+  
+  // Parse time strings with AM/PM
+  sscanf(timeIn, "%02d:%02d:%02d %s", &inHour, &inMin, &inSec, inAmpm);
+  sscanf(timeOut, "%02d:%02d:%02d %s", &outHour, &outMin, &outSec, outAmpm);
+  
+  // Convert 12-hour to 24-hour for calculation
+  if (strcmp(inAmpm, "PM") == 0 && inHour != 12) inHour += 12;
+  if (strcmp(inAmpm, "AM") == 0 && inHour == 12) inHour = 0;
+  if (strcmp(outAmpm, "PM") == 0 && outHour != 12) outHour += 12;
+  if (strcmp(outAmpm, "AM") == 0 && outHour == 12) outHour = 0;
+  
+  // Convert to minutes since midnight
+  int inMinutes = inHour * 60 + inMin;
+  int outMinutes = outHour * 60 + outMin;
+  
+  // Handle overnight sessions (if time out is earlier than time in, assume next day)
+  if (outMinutes < inMinutes) {
+    outMinutes += 24 * 60;
+  }
+  
+  int duration = outMinutes - inMinutes;
+  
+  Serial.printf("Duration calculation: %02d:%02d - %02d:%02d = %d minutes\n", 
+                inHour, inMin, outHour, outMin, duration);
+  
+  return duration;
+}
+
+// ============= FORCE RESET EEPROM FUNCTION =============
+void forceResetEEPROM() {
+  Serial.println("\n鈿狅笍 FORCE RESETTING EEPROM TO FACTORY DEFAULTS...");
+  
+  // Clear all EEPROM
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0);
+  }
+  EEPROM.commit();
+  
+  // Reset all global variables
+  studentCount = 0;
+  attendanceCount = 0;
+  registrationMode = false;
+  pendingName = "";
+  pendingGrade = "";
+  pendingSection = "";
+  pendingId = 0;
+  registrationStep = 1;
+  lastSuccessId = 0;
+  
+  // Reset time config to defaults
+  timeConfig.startHour = 8;
+  timeConfig.startMinute = 0;
+  timeConfig.endHour = 17;
+  timeConfig.endMinute = 0;
+  timeConfig.gracePeriod = 15;
+  timeConfig.autoDetect = true;
+  saveTimeConfig();
+  
+  // Clear fingerprint sensor
+  finger.emptyDatabase();
+  
+  // Rebuild cache
+  buildFingerprintCache();
+  rebuildStudentCache();
+  
+  Serial.println("鉁� EEPROM has been reset to factory defaults");
+  Serial.println("馃搳 You can now register new students\n");
+  
+  lcd.clear();
+  lcd.print("EEPROM Reset!");
+  lcd.setCursor(0, 1);
+  lcd.print("Ready to Register");
+  delay(2000);
+  
+  lcd.clear();
+  lcd.print("System Ready!");
+  lcd.setCursor(0, 1);
+  lcd.print("Place finger...");
+}
+
+// ============= REBUILD STUDENT CACHE =============
+void rebuildStudentCache() {
+  memset(studentIdToIndex, 0, sizeof(studentIdToIndex));
+  for (int i = 0; i < studentCount; i++) {
+    if (students[i].id <= 200) {
+      studentIdToIndex[students[i].id] = i + 1; // +1 because 0 means not found
+    }
+  }
+}
+
+// ============= EEPROM MIGRATION FUNCTION =============
+void migrateEEPROM() {
+  Serial.println("\n=== CHECKING EEPROM FORMAT ===");
+  
+  // Read the current student count
+  int oldCount = EEPROM.readInt(STUDENT_COUNT_ADDR);
+  
+  // If count is valid but seems like old format (too high or unreasonable)
+  if (oldCount > 0 && oldCount <= MAX_STUDENTS) {
+    Serial.print("Found ");
+    Serial.print(oldCount);
+    Serial.println(" students in old format. Attempting migration...");
+    
+    // Create temporary array for old data
+    struct OldStudent {
+      int id;
+      char name[20];
+      char grade[5];
+      char section[2];  // Old section size
+      bool isRegistered;
+    } oldStudents[MAX_STUDENTS];
+    
+    // Read old data
+    int addr = STUDENT_DATA_START;
+    for (int i = 0; i < oldCount; i++) {
+      oldStudents[i].id = EEPROM.readInt(addr);
+      addr += sizeof(int);
+      
+      EEPROM.readBytes(addr, oldStudents[i].name, 20);
+      oldStudents[i].name[19] = '\0';
+      addr += 20;
+      
+      EEPROM.readBytes(addr, oldStudents[i].grade, 5);
+      oldStudents[i].grade[4] = '\0';
+      addr += 5;
+      
+      EEPROM.readBytes(addr, oldStudents[i].section, 2);
+      oldStudents[i].section[1] = '\0';
+      addr += 2;
+      
+      oldStudents[i].isRegistered = EEPROM.readBool(addr);
+      addr += sizeof(bool);
+      
+      // Skip old padding (old record size was 32)
+      addr += 32 - (sizeof(int) + 20 + 5 + 2 + sizeof(bool));
+    }
+    
+    // Now clear the EEPROM for new format
+    for (int i = 0; i < EEPROM_SIZE; i++) {
+      EEPROM.write(i, 0);
+    }
+    
+    // Write data in new format
+    EEPROM.writeInt(STUDENT_COUNT_ADDR, oldCount);
+    addr = STUDENT_DATA_START;
+    
+    for (int i = 0; i < oldCount; i++) {
+      students[i].id = oldStudents[i].id;
+      strcpy(students[i].name, oldStudents[i].name);
+      strcpy(students[i].grade, oldStudents[i].grade);
+      strcpy(students[i].section, oldStudents[i].section); // This will copy the old 1-char section
+      students[i].isRegistered = oldStudents[i].isRegistered;
+      
+      // Write to EEPROM in new format
+      EEPROM.writeInt(addr, students[i].id);
+      addr += sizeof(int);
+      
+      EEPROM.writeBytes(addr, students[i].name, 20);
+      addr += 20;
+      
+      EEPROM.writeBytes(addr, students[i].grade, 5);
+      addr += 5;
+      
+      EEPROM.writeBytes(addr, students[i].section, 9);
+      addr += 9;
+      
+      EEPROM.writeBool(addr, students[i].isRegistered);
+      addr += sizeof(bool);
+      
+      // Add padding to reach STUDENT_RECORD_SIZE
+      int padding = STUDENT_RECORD_SIZE - (sizeof(int) + 20 + 5 + 9 + sizeof(bool));
+      for (int j = 0; j < padding; j++) {
+        EEPROM.write(addr + j, 0);
+      }
+      addr += padding;
+    }
+    
+    EEPROM.commit();
+    Serial.println("鉁� Migration complete!");
+  } else {
+    Serial.println("No migration needed or EEPROM already in new format.");
+  }
+  Serial.println("===============================\n");
+}
+
+// ============= WEBSERVER ROUTES =============
+void setupWebServer() {
+  server.on("/", []() {
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
+  
+  server.on("/api/locations", []() {
+    String json = "[";
+    for (int i = 0; i < LOCATION_COUNT; i++) {
+      if (i > 0) json += ",";
+      json += "\"" + String(locationNames[i]) + "\"";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/stats", []() {
+    DateTime now;
+    if (!validateAndFixRTC()) {
+      now = DateTime(F(__DATE__), F(__TIME__));
+    } else {
+      now = rtc.now();
+    }
+    
+    int todayCount = 0;
+    int lateToday = 0;
+    int activeNow = 0;
+    char today[11];
+    safeDateFormat(today, now.year(), now.month(), now.day());
+    
+    for (int i = 0; i < attendanceCount; i++) {
+      if (strcmp(attendanceRecords[i].date, today) == 0) {
+        todayCount++;
+        if (attendanceRecords[i].remark == 1) lateToday++; // Late
+        if (attendanceRecords[i].isActive) activeNow++;
+      }
+    }
+    
+    String json = "{\"totalStudents\":" + String(studentCount) + 
+                  ",\"todayAttendance\":" + String(todayCount) + 
+                  ",\"lateToday\":" + String(lateToday) + 
+                  ",\"activeNow\":" + String(activeNow) + "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/time-config", []() {
+    String json = "{";
+    json += "\"startHour\":" + String(timeConfig.startHour) + ",";
+    json += "\"startMinute\":" + String(timeConfig.startMinute) + ",";
+    json += "\"endHour\":" + String(timeConfig.endHour) + ",";
+    json += "\"endMinute\":" + String(timeConfig.endMinute) + ",";
+    json += "\"gracePeriod\":" + String(timeConfig.gracePeriod) + ",";
+    json += "\"autoDetect\":" + String(timeConfig.autoDetect ? "true" : "false");
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/save-time-config", HTTP_POST, []() {
+    if (server.hasArg("startHour") && server.hasArg("startMinute") && 
+        server.hasArg("endHour") && server.hasArg("endMinute") && 
+        server.hasArg("gracePeriod") && server.hasArg("autoDetect")) {
+      
+      timeConfig.startHour = server.arg("startHour").toInt();
+      timeConfig.startMinute = server.arg("startMinute").toInt();
+      timeConfig.endHour = server.arg("endHour").toInt();
+      timeConfig.endMinute = server.arg("endMinute").toInt();
+      timeConfig.gracePeriod = server.arg("gracePeriod").toInt();
+      timeConfig.autoDetect = server.arg("autoDetect") == "true";
+      
+      saveTimeConfig();
+      
+      server.send(200, "application/json", "{\"success\":true}");
+    } else {
+      server.send(400, "application/json", "{\"success\":false}");
+    }
+  });
+  
+  server.on("/api/check-rtc", []() {
+    DateTime now;
+    bool valid = validateAndFixRTC();
+    if (valid) {
+      now = rtc.now();
+    } else {
+      now = DateTime(F(__DATE__), F(__TIME__));
+    }
+    
+    char dateStr[11];
+    char timeStr[12];
+    safeDateFormat(dateStr, now.year(), now.month(), now.day());
+    safeTimeFormat(timeStr, now.hour(), now.minute(), now.second());
+    
+    String json = "{\"date\":\"" + String(dateStr) + 
+                  "\",\"time\":\"" + String(timeStr) + 
+                  "\",\"valid\":" + String(valid ? "true" : "false") + "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/sync-time", []() {
+    String response;
+    if (WiFi.status() == WL_CONNECTED) {
+      if (syncTimeWithNTP()) {
+        DateTime now = rtc.now();
+        char timeStr[12];
+        char dateStr[11];
+        safeTimeFormat(timeStr, now.hour(), now.minute(), now.second());
+        safeDateFormat(dateStr, now.year(), now.month(), now.day());
+        
+        response = "{\"success\":true,\"message\":\"Time synced successfully\",\"date\":\"" + 
+                   String(dateStr) + "\",\"time\":\"" + String(timeStr) + "\"}";
+      } else {
+        response = "{\"success\":false,\"message\":\"Failed to sync time\"}";
+      }
+    } else {
+      response = "{\"success\":false,\"message\":\"WiFi not connected\"}";
+    }
+    server.send(200, "application/json", response);
+  });
+  
+  server.on("/api/set-time", HTTP_POST, []() {
+    if (server.hasArg("year") && server.hasArg("month") && server.hasArg("day") &&
+        server.hasArg("hour") && server.hasArg("minute") && server.hasArg("second")) {
+      
+      int year = server.arg("year").toInt();
+      int month = server.arg("month").toInt();
+      int day = server.arg("day").toInt();
+      int hour = server.arg("hour").toInt();
+      int minute = server.arg("minute").toInt();
+      int second = server.arg("second").toInt();
+      
+      setManualTime(year, month, day, hour, minute, second);
+      
+      server.send(200, "application/json", "{\"success\":true}");
+    } else {
+      server.send(400, "application/json", "{\"success\":false,\"message\":\"Missing parameters\"}");
+    }
+  });
+  
+  server.on("/api/current-time", []() {
+    DateTime now;
+    if (!validateAndFixRTC()) {
+      now = DateTime(F(__DATE__), F(__TIME__));
+    } else {
+      now = rtc.now();
+    }
+    
+    char dateStr[11];
+    char timeStr[12];
+    safeDateFormat(dateStr, now.year(), now.month(), now.day());
+    safeTimeFormat(timeStr, now.hour(), now.minute(), now.second());
+    
+    String json = "{\"date\":\"" + String(dateStr) + 
+                  "\",\"time\":\"" + String(timeStr) + 
+                  "\",\"hour24\":" + String(now.hour()) + 
+                  ",\"minute\":" + String(now.minute()) + 
+                  ",\"second\":" + String(now.second()) + "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/sync-ntp", []() {
+    String response;
+    if (WiFi.status() == WL_CONNECTED) {
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+      
+      struct tm timeinfo;
+      if (getLocalTime(&timeinfo)) {
+        DateTime ntpTime = DateTime(
+          timeinfo.tm_year + 1900,
+          timeinfo.tm_mon + 1,
+          timeinfo.tm_mday,
+          timeinfo.tm_hour,
+          timeinfo.tm_min,
+          timeinfo.tm_sec
+        );
+        
+        rtc.adjust(ntpTime);
+        
+        char timeStr[12];
+        safeTimeFormat(timeStr, ntpTime.hour(), ntpTime.minute(), ntpTime.second());
+        
+        response = "{\"success\":true,\"message\":\"RTC synced with NTP\",\"time\":\"" + String(timeStr) + "\"}";
+      } else {
+        response = "{\"success\":false,\"message\":\"Failed to get NTP time\"}";
+      }
+    } else {
+      response = "{\"success\":false,\"message\":\"WiFi not connected\"}";
+    }
+    server.send(200, "application/json", response);
+  });
+  
+  server.on("/api/clear-active-sessions", []() {
+    int cleared = 0;
+    for (int i = 0; i < attendanceCount; i++) {
+      if (attendanceRecords[i].isActive) {
+        attendanceRecords[i].isActive = false;
+        cleared++;
+      }
+    }
+    if (cleared > 0) {
+      saveAttendance();
+    }
+    String json = "{\"success\":true,\"cleared\":" + String(cleared) + "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/students", []() {
+    String json = "{\"students\":[";
+    for (int i = 0; i < studentCount; i++) {
+      if (i > 0) json += ",";
+      json += "{\"id\":" + String(students[i].id) + 
+              ",\"name\":\"" + String(students[i].name) + 
+              "\",\"grade\":\"" + String(students[i].grade) + 
+              "\",\"section\":\"" + String(students[i].section) + "\"}";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/attendance", []() {
+    String json = "{\"records\":[";
+    int startIdx = max(0, attendanceCount-200);
+    for (int i = startIdx; i < attendanceCount; i++) {
+      Student* s = findStudentById(attendanceRecords[i].studentId);
+      if (s) {
+        if (i > startIdx) json += ",";
+        json += "{\"name\":\"" + String(s->name) + 
+                "\",\"grade\":\"" + String(s->grade) + 
+                "\",\"section\":\"" + String(s->section) + 
+                "\",\"location\":\"" + getLocationName(attendanceRecords[i].location) +
+                "\",\"date\":\"" + String(attendanceRecords[i].date) + 
+                "\",\"timeIn\":\"" + String(attendanceRecords[i].timeIn) + 
+                "\",\"timeOut\":\"" + String(attendanceRecords[i].timeOut) + 
+                "\",\"duration\":" + String(attendanceRecords[i].duration) +
+                ",\"remark\":\"" + String(getRemarkText(attendanceRecords[i].remark)) +
+                "\",\"isActive\":" + String(attendanceRecords[i].isActive ? "true" : "false") + "}";
+      }
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/export-attendance", []() {
+    String json = "{\"records\":[";
+    for (int i = 0; i < attendanceCount; i++) {
+      Student* s = findStudentById(attendanceRecords[i].studentId);
+      if (s) {
+        if (i > 0) json += ",";
+        json += "{\"name\":\"" + String(s->name) + 
+                "\",\"grade\":\"" + String(s->grade) + 
+                "\",\"section\":\"" + String(s->section) + 
+                "\",\"location\":\"" + getLocationName(attendanceRecords[i].location) +
+                "\",\"date\":\"" + String(attendanceRecords[i].date) + 
+                "\",\"timeIn\":\"" + String(attendanceRecords[i].timeIn) + 
+                "\",\"timeOut\":\"" + String(attendanceRecords[i].timeOut) + 
+                "\",\"duration\":" + String(attendanceRecords[i].duration) +
+                ",\"remark\":\"" + String(getRemarkText(attendanceRecords[i].remark)) +
+                "\",\"isActive\":" + String(attendanceRecords[i].isActive ? "true" : "false") + "}";
+      }
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/attendance-summary", []() {
+    DateTime now;
+    if (!validateAndFixRTC()) {
+      now = DateTime(F(__DATE__), F(__TIME__));
+    } else {
+      now = rtc.now();
+    }
+    
+    char today[11];
+    safeDateFormat(today, now.year(), now.month(), now.day());
+    
+    int todayCount = 0;
+    int activeNow = 0;
+    int lateToday = 0;
+    int ontimeToday = 0;
+    int locationCounts[LOCATION_COUNT] = {0};
+    int locationLate[LOCATION_COUNT] = {0};
+    int locationOntime[LOCATION_COUNT] = {0};
+    
+    for (int i = 0; i < attendanceCount; i++) {
+      if (strcmp(attendanceRecords[i].date, today) == 0) {
+        todayCount++;
+        if (attendanceRecords[i].location >= 0 && attendanceRecords[i].location < LOCATION_COUNT) {
+          locationCounts[attendanceRecords[i].location]++;
+          if (attendanceRecords[i].isActive) activeNow++;
+          
+          if (attendanceRecords[i].remark == 1) { // Late
+            lateToday++;
+            locationLate[attendanceRecords[i].location]++;
+          } else if (attendanceRecords[i].remark == 0) { // On Time
+            ontimeToday++;
+            locationOntime[attendanceRecords[i].location]++;
+          }
+        }
+      }
+    }
+    
+    String json = "{\"totalToday\":" + String(todayCount) + 
+                  ",\"activeNow\":" + String(activeNow) + 
+                  ",\"lateToday\":" + String(lateToday) + 
+                  ",\"ontimeToday\":" + String(ontimeToday) + 
+                  ",\"locationSummary\":{";
+    
+    for (int i = 0; i < LOCATION_COUNT; i++) {
+      if (i > 0) json += ",";
+      json += "\"" + String(locationNames[i]) + "\":" + String(locationCounts[i]);
+    }
+    json += "},\"locationLate\":{";
+    for (int i = 0; i < LOCATION_COUNT; i++) {
+      if (i > 0) json += ",";
+      json += "\"" + String(locationNames[i]) + "\":" + String(locationLate[i]);
+    }
+    json += "},\"locationOntime\":{";
+    for (int i = 0; i < LOCATION_COUNT; i++) {
+      if (i > 0) json += ",";
+      json += "\"" + String(locationNames[i]) + "\":" + String(locationOntime[i]);
+    }
+    json += "}}";
+    
+    server.send(200, "application/json", json);
+  });
+  
+  // Filtered attendance endpoint
+  server.on("/api/filtered-attendance", []() {
+    DateTime now;
+    if (!validateAndFixRTC()) {
+      now = DateTime(F(__DATE__), F(__TIME__));
+    } else {
+      now = rtc.now();
+    }
+    
+    char today[11];
+    safeDateFormat(today, now.year(), now.month(), now.day());
+    
+    String filter = server.hasArg("filter") ? server.arg("filter") : "all";
+    String location = server.hasArg("location") ? server.arg("location") : "";
+    
+    String json = "{\"records\":[";
+    bool first = true;
+    
+    for (int i = 0; i < attendanceCount; i++) {
+      bool include = false;
+      
+      if (filter == "all") {
+        include = true;
+      } else if (filter == "today") {
+        include = (strcmp(attendanceRecords[i].date, today) == 0);
+      } else if (filter == "active") {
+        include = attendanceRecords[i].isActive;
+      } else if (filter == "late") {
+        include = (strcmp(attendanceRecords[i].date, today) == 0 && attendanceRecords[i].remark == 1);
+        // Filter by location if specified
+        if (include && location != "") {
+          include = (String(locationNames[attendanceRecords[i].location]) == location);
+        }
+      } else if (filter == "ontime") {
+        include = (strcmp(attendanceRecords[i].date, today) == 0 && attendanceRecords[i].remark == 0);
+        // Filter by location if specified
+        if (include && location != "") {
+          include = (String(locationNames[attendanceRecords[i].location]) == location);
+        }
+      } else if (filter == "location") {
+        include = (strcmp(attendanceRecords[i].date, today) == 0 && 
+                  String(locationNames[attendanceRecords[i].location]) == location);
+      }
+      
+      if (include) {
+        Student* s = findStudentById(attendanceRecords[i].studentId);
+        if (s) {
+          if (!first) json += ",";
+          first = false;
+          
+          json += "{\"name\":\"" + String(s->name) + 
+                  "\",\"grade\":\"" + String(s->grade) + 
+                  "\",\"section\":\"" + String(s->section) + 
+                  "\",\"location\":\"" + getLocationName(attendanceRecords[i].location) +
+                  "\",\"timeIn\":\"" + String(attendanceRecords[i].timeIn) + 
+                  "\",\"timeOut\":\"" + String(attendanceRecords[i].timeOut) + 
+                  "\",\"remark\":\"" + String(getRemarkText(attendanceRecords[i].remark)) +
+                  "\",\"isActive\":" + String(attendanceRecords[i].isActive ? "true" : "false") + "}";
+        }
+      }
+    }
+    
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+  
+  // Sensor capacity endpoint
+  server.on("/api/sensor-capacity", []() {
+    finger.getTemplateCount();
+    String json = "{\"current\":" + String(finger.templateCount) + 
+                  ",\"max\":" + String(MAX_FINGERPRINT_CAPACITY) + "}";
+    server.send(200, "application/json", json);
+  });
+  
+  // Reset EEPROM endpoint
+  server.on("/api/reset-eeprom", []() {
+    forceResetEEPROM();
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"EEPROM reset to factory defaults\"}");
+  });
+  
+  // ============= REGISTER-START HANDLER =============
+  server.on("/api/register-start", HTTP_POST, []() {
+    if (server.hasArg("name") && server.hasArg("grade") && server.hasArg("section")) {
+      
+      // Check if already in registration mode
+      if (registrationMode) {
+        server.send(200, "application/json", "{\"success\":false, \"message\":\"Registration already in progress\"}");
+        return;
+      }
+      
+      // Make sure sensor is ready
+      if (!finger.verifyPassword()) {
+        server.send(200, "application/json", "{\"success\":false, \"message\":\"Fingerprint sensor not responding\"}");
+        return;
+      }
+      
+      // Check sensor capacity
+      finger.getTemplateCount();
+      if (finger.templateCount >= MAX_FINGERPRINT_CAPACITY - 5) {
+        server.send(200, "application/json", "{\"success\":false, \"message\":\"Fingerprint sensor is almost full. Please delete some fingerprints.\"}");
+        return;
+      }
+      
+      pendingName = server.arg("name");
+      pendingGrade = server.arg("grade");
+      pendingSection = server.arg("section");
+      
+      if (studentCount >= MAX_STUDENTS) {
+        server.send(200, "application/json", "{\"success\":false, \"message\":\"Maximum students reached\"}");
+        return;
+      }
+      
+      pendingId = getNextAvailableId();
+      
+      // Clear any pending data in sensor
+      finger.getImage();
+      delay(100);
+      finger.getImage(); // Double clear
+      
+      // Clear lastSuccessId when starting a new registration
+      lastSuccessId = 0;
+      
+      // Reset all registration flags
+      registrationMode = true;
+      registrationStep = 1;  // Start at step 1
+      registrationStartTime = millis();
+      
+      lcd.clear();
+      lcd.print("Register: ");
+      lcd.setCursor(0, 1);
+      lcd.print(pendingName.substring(0, 16));
+      delay(2000);
+      
+      lcd.clear();
+      lcd.print("Place finger");
+      lcd.setCursor(0, 1);
+      lcd.print("to register...");
+      
+      Serial.println("馃摑 Registration started for: " + pendingName);
+      Serial.print("馃啍 ID: ");
+      Serial.println(pendingId);
+      Serial.print("馃搳 Sensor capacity: ");
+      Serial.print(finger.templateCount);
+      Serial.print("/");
+      Serial.println(MAX_FINGERPRINT_CAPACITY);
+      
+      server.send(200, "application/json", "{\"success\":true}");
+    } else {
+      server.send(400, "application/json", "{\"success\":false}");
+    }
+  });
+  
+  // ============= REGISTER-STATUS HANDLER =============
+  server.on("/api/register-status", []() {
+    String json;
+    
+    if (registrationMode) {
+      // Still in registration mode
+      if (registrationStep == 1) {
+        json = "{\"status\":\"waiting\"}";
+      } else if (registrationStep == 2) {
+        json = "{\"status\":\"scan1\"}";
+      } else if (registrationStep == 3) {
+        json = "{\"status\":\"scan2\"}";
+      } else if (registrationStep == 4) {
+        json = "{\"status\":\"saving\"}";
+      } else {
+        json = "{\"status\":\"waiting\"}";
+      }
+    } else {
+      // Registration mode is false - check if we have a successful registration
+      if (lastSuccessId > 0) {
+        // Find the student that was just registered
+        bool found = false;
+        for (int i = 0; i < studentCount; i++) {
+          if (students[i].id == lastSuccessId) {
+            json = "{\"status\":\"success\",\"name\":\"" + String(students[i].name) + 
+                   "\",\"grade\":\"" + String(students[i].grade) + 
+                   "\",\"section\":\"" + String(students[i].section) + 
+                   "\",\"id\":" + String(students[i].id) + "}";
+            found = true;
+            Serial.print("鉁� Sending success for ID: ");
+            Serial.println(lastSuccessId);
+            break;
+          }
+        }
+        if (!found) {
+          json = "{\"status\":\"failed\",\"message\":\"Student not found in database\"}";
+        }
+      } else {
+        json = "{\"status\":\"failed\",\"message\":\"Registration cancelled\"}";
+      }
+    }
+    
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/register-cancel", []() {
+    resetRegistration();
+    lcd.clear();
+    showMainMenu();
+    server.send(200, "application/json", "{\"success\":true}");
+    Serial.println("鉂� Registration cancelled");
+  });
+  
+  server.on("/api/start-scan", []() {
+    if (server.hasArg("location")) {
+      selectedLocation = server.arg("location").toInt();
+      if (selectedLocation < 0 || selectedLocation >= LOCATION_COUNT) selectedLocation = 0;
+    }
+    
+    fingerprintMode = true;
+    lcd.clear();
+    lcd.print(locationNames[selectedLocation]);
+    lcd.setCursor(0, 1);
+    lcd.print("Ready...");
+    server.send(200, "application/json", "{\"success\":true}");
+    Serial.print("馃憜 Scanning at: ");
+    Serial.println(locationNames[selectedLocation]);
+  });
+  
+  server.on("/api/scan-result", []() {
+    if (currentScanResult != "") {
+      server.send(200, "application/json", currentScanResult);
+      currentScanResult = "";
+    } else {
+      server.send(200, "application/json", "{\"scanned\":false}");
+    }
+  });
+  
+  server.on("/api/cancel-scan", []() {
+    fingerprintMode = false;
+    lcd.clear();
+    showMainMenu();
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+  
+  server.on("/api/delete-student", HTTP_POST, []() {
+    if (server.hasArg("id")) {
+      int id = server.arg("id").toInt();
+      
+      for (int i = 0; i < studentCount; i++) {
+        if (students[i].id == id) {
+          // Delete from fingerprint sensor
+          Serial.print("馃棏锔� Deleting fingerprint ID ");
+          Serial.print(id);
+          Serial.print(" from sensor... ");
+          
+          uint8_t p = finger.deleteModel(id);
+          if (p == FINGERPRINT_OK) {
+            Serial.println("鉁� Success");
+          } else {
+            Serial.print("鉂� Failed: ");
+            Serial.println(getErrorMessage(p));
+          }
+          
+          // Remove from array
+          for (int j = i; j < studentCount-1; j++) students[j] = students[j+1];
+          studentCount--;
+          
+          // Save to EEPROM
+          saveStudents();
+          
+          // Rebuild cache
+          buildFingerprintCache();
+          rebuildStudentCache();
+          
+          Serial.print("馃棏锔� Deleted student ID: ");
+          Serial.println(id);
+          
+          server.send(200, "application/json", "{\"success\":true}");
+          return;
+        }
+      }
+      
+      server.send(404, "application/json", "{\"success\":false,\"message\":\"Student not found\"}");
+    } else {
+      server.send(400, "application/json", "{\"success\":false,\"message\":\"Missing ID\"}");
+    }
+  });
+  
+  // Debug endpoints
+  server.on("/api/test-sensor", []() {
+    String result;
+    if (finger.verifyPassword()) {
+      finger.getTemplateCount();
+      
+      // Test image capture
+      uint8_t p = finger.getImage();
+      int confidence = 0;
+      if (p == FINGERPRINT_OK) {
+        confidence = 100;
+      }
+      
+      result = "{\"success\":true,\"message\":\"Sensor OK\",\"templates\":" + String(finger.templateCount) + ",\"confidence\":" + String(confidence) + "}";
+    } else {
+      result = "{\"success\":false,\"message\":\"Sensor not responding\"}";
+    }
+    server.send(200, "application/json", result);
+  });
+  
+  server.on("/api/debug-state", []() {
+    String json = "{";
+    json += "\"registrationMode\":" + String(registrationMode ? "true" : "false") + ",";
+    json += "\"registrationStep\":" + String(registrationStep) + ",";
+    json += "\"pendingId\":" + String(pendingId) + ",";
+    json += "\"lastSuccessId\":" + String(lastSuccessId) + ",";
+    json += "\"studentCount\":" + String(studentCount) + ",";
+    json += "\"attendanceCount\":" + String(attendanceCount) + "";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/clear-all-data", []() {
+    String response;
+    
+    // Clear EEPROM
+    for (int i = 0; i < EEPROM_SIZE; i++) {
+      EEPROM.write(i, 0);
+    }
+    EEPROM.commit();
+    
+    // Reset time config to defaults
+    timeConfig.startHour = 8;
+    timeConfig.startMinute = 0;
+    timeConfig.endHour = 17;
+    timeConfig.endMinute = 0;
+    timeConfig.gracePeriod = 15;
+    timeConfig.autoDetect = true;
+    saveTimeConfig();
+    
+    // Clear all fingerprints from sensor
+    Serial.println("馃棏锔� Deleting all fingerprints from sensor...");
+    uint8_t p = finger.emptyDatabase();
+    
+    if (p == FINGERPRINT_OK) {
+      Serial.println("鉁� All fingerprints deleted from sensor");
+      response = "{\"success\":true,\"message\":\"EEPROM and fingerprints cleared\"}";
+    } else {
+      Serial.print("鉂� Failed to delete fingerprints. Error: ");
+      Serial.println(getErrorMessage(p));
+      response = "{\"success\":true,\"message\":\"EEPROM cleared but sensor error: " + getErrorMessage(p) + "\"}";
+    }
+    
+    // Reset local data
+    studentCount = 0;
+    attendanceCount = 0;
+    resetRegistration();
+    lastSuccessId = 0;
+    
+    // Rebuild cache
+    buildFingerprintCache();
+    rebuildStudentCache();
+    
+    server.send(200, "application/json", response);
+    Serial.println("鈿狅笍 All data cleared");
+  });
+  
+  server.on("/api/clear-fingerprints", []() {
+    Serial.println("馃棏锔� Deleting all fingerprints from sensor...");
+    uint8_t p = finger.emptyDatabase();
+    
+    String response;
+    if (p == FINGERPRINT_OK) {
+      response = "{\"success\":true,\"message\":\"All fingerprints deleted\"}";
+      Serial.println("鉁� All fingerprints deleted from sensor");
+    } else {
+      response = "{\"success\":false,\"message\":\"" + getErrorMessage(p) + "\"}";
+      Serial.print("鉂� Failed to delete fingerprints. Error: ");
+      Serial.println(getErrorMessage(p));
+    }
+    
+    // Also remove students from database if they have no fingerprints
+    for (int i = studentCount-1; i >= 0; i--) {
+      if (finger.loadModel(students[i].id) != FINGERPRINT_OK) {
+        for (int j = i; j < studentCount-1; j++) students[j] = students[j+1];
+        studentCount--;
+      }
+    }
+    saveStudents();
+    buildFingerprintCache();
+    rebuildStudentCache();
+    
+    server.send(200, "application/json", response);
+  });
+  
+  server.on("/api/list-fingerprints", []() {
+    String json = "{\"ids\":[";
+    String inDB = ",\"inDatabase\":[";
+    bool firstId = true;
+    bool firstDB = true;
+    
+    finger.getTemplateCount();
+    int found = 0;
+    
+    for (int id = 1; id <= 200 && found < finger.templateCount; id++) {
+      if (finger.loadModel(id) == FINGERPRINT_OK) {
+        if (!firstId) json += ",";
+        json += String(id);
+        firstId = false;
+        found++;
+        
+        // Check if in database
+        bool inDatabase = false;
+        for (int i = 0; i < studentCount; i++) {
+          if (students[i].id == id) {
+            inDatabase = true;
+            break;
+          }
+        }
+        
+        if (!firstDB) inDB += ",";
+        inDB += inDatabase ? "true" : "false";
+        firstDB = false;
+      }
+    }
+    
+    json += "]" + inDB + "]}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/delete-fingerprint", HTTP_POST, []() {
+    if (server.hasArg("id")) {
+      int id = server.arg("id").toInt();
+      
+      Serial.print("馃棏锔� Deleting fingerprint ID ");
+      Serial.print(id);
+      Serial.print(" from sensor... ");
+      
+      uint8_t p = finger.deleteModel(id);
+      
+      String response;
+      if (p == FINGERPRINT_OK) {
+        response = "{\"success\":true,\"message\":\"Fingerprint " + String(id) + " deleted\"}";
+        Serial.println("鉁� Success");
+        
+        // Also remove from student database if exists
+        for (int i = 0; i < studentCount; i++) {
+          if (students[i].id == id) {
+            for (int j = i; j < studentCount-1; j++) students[j] = students[j+1];
+            studentCount--;
+            saveStudents();
+            break;
+          }
+        }
+        
+        buildFingerprintCache();
+        rebuildStudentCache();
+        
+      } else {
+        response = "{\"success\":false,\"message\":\"" + getErrorMessage(p) + "\"}";
+        Serial.print("鉂� Failed: ");
+        Serial.println(getErrorMessage(p));
+      }
+      
+      server.send(200, "application/json", response);
+    } else {
+      server.send(400, "application/json", "{\"success\":false,\"message\":\"Missing ID\"}");
+    }
+  });
+  
+  server.on("/api/check-consistency", []() {
+    int studentsInDB = studentCount;
+    int fingerprintsInSensor = 0;
+    int matching = 0;
+    int orphaned = 0;
+    int missing = 0;
+    
+    finger.getTemplateCount();
+    int sensorCount = finger.templateCount;
+    
+    // Count fingerprints in sensor
+    for (int id = 1; id <= 200 && fingerprintsInSensor < sensorCount; id++) {
+      if (finger.loadModel(id) == FINGERPRINT_OK) {
+        fingerprintsInSensor++;
+        
+        // Check if in database
+        bool found = false;
+        for (int i = 0; i < studentCount; i++) {
+          if (students[i].id == id) {
+            found = true;
+            matching++;
+            break;
+          }
+        }
+        if (!found) orphaned++;
+      }
+    }
+    
+    // Check for missing in sensor
+    for (int i = 0; i < studentCount; i++) {
+      if (finger.loadModel(students[i].id) != FINGERPRINT_OK) {
+        missing++;
+      }
+    }
+    
+    String json = "{\"studentsInDB\":" + String(studentsInDB) + 
+                  ",\"fingerprintsInSensor\":" + String(fingerprintsInSensor) + 
+                  ",\"matching\":" + String(matching) + 
+                  ",\"orphaned\":" + String(orphaned) + 
+                  ",\"missing\":" + String(missing) + "}";
+    
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/clean-orphaned", []() {
+    int cleaned = 0;
+    
+    finger.getTemplateCount();
+    int sensorCount = finger.templateCount;
+    
+    for (int id = 1; id <= 200 && cleaned < sensorCount; id++) {
+      if (finger.loadModel(id) == FINGERPRINT_OK) {
+        bool inDatabase = false;
+        for (int i = 0; i < studentCount; i++) {
+          if (students[i].id == id) {
+            inDatabase = true;
+            break;
+          }
+        }
+        if (!inDatabase) {
+          finger.deleteModel(id);
+          cleaned++;
+        }
+      }
+    }
+    
+    String json = "{\"success\":true,\"cleaned\":" + String(cleaned) + "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/api/registration-state", []() {
+    String json = "{\"registrationMode\":" + String(registrationMode ? "true" : "false") + 
+                  ",\"registrationStep\":" + String(registrationStep) + 
+                  ",\"pendingId\":" + String(pendingId) + 
+                  ",\"lastSuccessId\":" + String(lastSuccessId) + "}";
+    server.send(200, "application/json", json);
+  });
+}
+
+// ============= MAIN LOOP =============
+void loop() {
+  server.handleClient();
+  
+  if (fingerprintMode) {
+    quickScan();
+  }
+  
+  if (registrationMode) {
+    handleRegistration();
+  }
+  
+  if (millis() - lastLCDUpdate > LCD_UPDATE_INTERVAL && !fingerprintMode && !registrationMode) {
+    lastLCDUpdate = millis();
+    showMainMenu();
+  }
+  
+  delay(WEBSERVER_PROCESS_INTERVAL);
+}
+
+// ============= OPTIMIZED FAST SCAN FUNCTION =============
+void quickScan() {
+  if (millis() - lastScanCheck < SCAN_INTERVAL_MS) {
+    return;
+  }
+  lastScanCheck = millis();
+  
+  uint8_t p = finger.getImage();
+  
+  if (p == FINGERPRINT_OK) {
+    p = finger.image2Tz();
+    if (p == FINGERPRINT_OK) {
+      p = finger.fingerFastSearch();
+      
+      if (p == FINGERPRINT_OK) {
+        int fingerprintId = finger.fingerID;
+        
+        // Use cache for faster student lookup
+        int studentIndex = -1;
+        if (fingerprintId <= 200) {
+          studentIndex = studentIdToIndex[fingerprintId] - 1;
+        }
+        
+        // Fallback to linear search if cache miss
+        if (studentIndex < 0) {
+          for (int i = 0; i < studentCount; i++) {
+            if (students[i].id == fingerprintId) {
+              studentIndex = i;
+              break;
+            }
+          }
+        }
+        
+        if (studentIndex >= 0) {
+          Student* student = &students[studentIndex];
+          
+          // Get current time with validation
+          DateTime now;
+          if (!validateAndFixRTC()) {
+            now = DateTime(F(__DATE__), F(__TIME__));
+            Serial.println("鈿狅笍 Using compile time as fallback");
+          } else {
+            now = rtc.now();
+          }
+          
+          // Format current date
+          char today[11];
+          safeDateFormat(today, now.year(), now.month(), now.day());
+          
+          // Format current time in 12-hour format
+          char timeStr[12];
+          safeTimeFormat(timeStr, now.hour(), now.minute(), now.second());
+          
+          // Debug print
+          Serial.printf("Current time: %04d/%02d/%02d %s\n", 
+                        now.year(), now.month(), now.day(), timeStr);
+          
+          // Check if student has an active session (checked in but not checked out)
+          int activeIndex = -1;
+          for (int i = attendanceCount - 1; i >= 0; i--) {
+            if (attendanceRecords[i].studentId == fingerprintId && 
+                strcmp(attendanceRecords[i].date, today) == 0 &&
+                attendanceRecords[i].isActive) {
+              activeIndex = i;
+              break;
+            }
+          }
+          
+          if (activeIndex >= 0) {
+            // Found active session - this is TIME OUT
+            Serial.printf("Found active session at index %d - recording TIME OUT\n", activeIndex);
+            
+            // Record time out
+            strcpy(attendanceRecords[activeIndex].timeOut, timeStr);
+            attendanceRecords[activeIndex].isActive = false;
+            
+            // Calculate duration
+            attendanceRecords[activeIndex].duration = calculateDuration(
+              attendanceRecords[activeIndex].timeIn, 
+              attendanceRecords[activeIndex].timeOut
+            );
+            
+            // Calculate remark for time out
+            attendanceRecords[activeIndex].remark = calculateRemark(now, false);
+            
+            // Auto-save immediately
+            saveAttendance();
+            
+            String remarkText = getRemarkText(attendanceRecords[activeIndex].remark);
+            currentScanResult = "{\"scanned\":true,\"name\":\"" + String(student->name) + 
+                               "\",\"grade\":\"" + String(student->grade) + 
+                               "\",\"section\":\"" + String(student->section) + 
+                               "\",\"location\":\"" + getLocationName(attendanceRecords[activeIndex].location) +
+                               "\",\"time\":\"" + String(timeStr) + 
+                               "\",\"type\":\"Time Out\"" +
+                               ",\"remark\":\"" + remarkText + "\"}";
+            
+            lcd.clear();
+            lcd.print(student->name);
+            lcd.setCursor(0, 1);
+            lcd.print("OUT ");
+            lcd.print(timeStr);
+            lcd.print(" ");
+            lcd.print(remarkText.substring(0, 4));
+            
+            Serial.printf("鉁� Time Out recorded for %s at %s\n", student->name, timeStr);
+            
+          } else {
+            // No active session - this is TIME IN
+            Serial.println("No active session found - recording TIME IN");
+            
+            if (attendanceCount < MAX_ATTENDANCE) {
+              int remark = calculateRemark(now, true);
+              
+              attendanceRecords[attendanceCount].studentId = fingerprintId;
+              strcpy(attendanceRecords[attendanceCount].timeIn, timeStr);
+              strcpy(attendanceRecords[attendanceCount].timeOut, "");
+              strcpy(attendanceRecords[attendanceCount].date, today);
+              attendanceRecords[attendanceCount].location = selectedLocation;
+              attendanceRecords[attendanceCount].isActive = true;
+              attendanceRecords[attendanceCount].remark = remark;
+              attendanceRecords[attendanceCount].duration = 0;
+              attendanceCount++;
+              
+              // Auto-save immediately
+              saveAttendance();
+              
+              String remarkText = getRemarkText(remark);
+              currentScanResult = "{\"scanned\":true,\"name\":\"" + String(student->name) + 
+                                 "\",\"grade\":\"" + String(student->grade) + 
+                                 "\",\"section\":\"" + String(student->section) + 
+                                 "\",\"location\":\"" + getLocationName(selectedLocation) +
+                                 "\",\"time\":\"" + String(timeStr) + 
+                                 "\",\"type\":\"Time In\"" +
+                                 ",\"remark\":\"" + remarkText + "\"}";
+              
+              lcd.clear();
+              lcd.print(student->name);
+              lcd.setCursor(0, 1);
+              lcd.print("IN ");
+              lcd.print(timeStr);
+              lcd.print(" ");
+              lcd.print(remarkText.substring(0, 4));
+              
+              Serial.printf("鉁� Time In recorded for %s at %s\n", student->name, timeStr);
+            }
+          }
+          
+          delay(800);
+          lcd.clear();
+          lcd.print("System Ready!");
+          lcd.setCursor(0, 1);
+          lcd.print("Place finger...");
+          
+        } else {
+          lcd.clear();
+          lcd.print("Not Registered!");
+          delay(600);
+          lcd.clear();
+          lcd.print("System Ready!");
+          lcd.setCursor(0, 1);
+          lcd.print("Place finger...");
+        }
+      } else {
+        lcd.clear();
+        lcd.print("No Match!");
+        delay(400);
+        lcd.clear();
+        lcd.print("System Ready!");
+        lcd.setCursor(0, 1);
+        lcd.print("Place finger...");
+      }
+    }
+  }
+}
+
+// ============= GET REMARK TEXT =============
+String getRemarkText(int remark) {
+  switch(remark) {
+    case 0: return "On Time";
+    case 1: return "Late";
+    case 2: return "Early";
+    case 3: return "Overtime";
+    case 4: return "Normal";
+    default: return "Unknown";
+  }
+}
+
+// ============= SIMPLIFIED REGISTRATION FUNCTION =============
+void handleRegistration() {
+  // Check timeout
+  if (millis() - registrationStartTime > 60000) {
+    Serial.println("鈴� Registration timeout");
+    lcd.clear();
+    lcd.print("Timeout!");
+    lcd.setCursor(0, 1);
+    lcd.print("Try again");
+    delay(2000);
+    registrationMode = false;
+    lcd.clear();
+    lcd.print("System Ready!");
+    lcd.setCursor(0, 1);
+    lcd.print("Place finger...");
+    return;
+  }
+  
+  // Simple state machine with longer delays
+  switch(registrationStep) {
+    case 1: // Wait for first finger
+      {
+        int p = finger.getImage();
+        if (p == FINGERPRINT_OK) {
+          Serial.println("鉁� First image captured");
+          lcd.clear();
+          lcd.print("Processing...");
+          delay(500);
+          
+          p = finger.image2Tz(1);
+          if (p == FINGERPRINT_OK) {
+            Serial.println("鉁� First image converted");
+            lcd.clear();
+            lcd.print("Remove finger");
+            lcd.setCursor(0, 1);
+            lcd.print("Now");
+            registrationStep = 2;
+            delay(2000);
+          } else {
+            Serial.print("鉂� Conversion failed: ");
+            Serial.println(getErrorMessage(p));
+            lcd.clear();
+            lcd.print("Bad fingerprint");
+            delay(2000);
+            // Stay in step 1
+          }
+        }
+        break;
+      }
+      
+    case 2: // Wait for finger removal
+      {
+        int p = finger.getImage();
+        if (p == FINGERPRINT_NOFINGER) {
+          Serial.println("鉁� Finger removed");
+          lcd.clear();
+          lcd.print("Place same");
+          lcd.setCursor(0, 1);
+          lcd.print("finger again");
+          registrationStep = 3;
+          delay(2000);
+        }
+        break;
+      }
+      
+    case 3: // Wait for second finger
+      {
+        int p = finger.getImage();
+        if (p == FINGERPRINT_OK) {
+          Serial.println("鉁� Second image captured");
+          lcd.clear();
+          lcd.print("Processing...");
+          delay(500);
+          
+          p = finger.image2Tz(2);
+          if (p == FINGERPRINT_OK) {
+            Serial.println("鉁� Second image converted");
+            lcd.clear();
+            lcd.print("Creating model...");
+            delay(500);
+            
+            // Create the model
+            p = finger.createModel();
+            Serial.print("Create model result: ");
+            Serial.println(getErrorMessage(p));
+            
+            if (p == FINGERPRINT_OK) {
+              Serial.println("鉁� Model created");
+              
+              // Check if we have space
+              if (studentCount >= MAX_STUDENTS) {
+                lcd.clear();
+                lcd.print("Max Students!");
+                delay(2000);
+                registrationMode = false;
+                lcd.clear();
+                lcd.print("System Ready!");
+                lcd.setCursor(0, 1);
+                lcd.print("Place finger...");
+                return;
+              }
+              
+              // Store the model
+              p = finger.storeModel(pendingId);
+              Serial.print("Store model result: ");
+              Serial.println(getErrorMessage(p));
+              
+              if (p == FINGERPRINT_OK) {
+                // Save student
+                students[studentCount].id = pendingId;
+                pendingName.toCharArray(students[studentCount].name, 20);
+                pendingGrade.toCharArray(students[studentCount].grade, 5);
+                pendingSection.toCharArray(students[studentCount].section, 9);
+                
+                students[studentCount].name[19] = '\0';
+                students[studentCount].grade[4] = '\0';
+                students[studentCount].section[8] = '\0';
+                students[studentCount].isRegistered = true;
+                studentCount++;
+                
+                // Auto-save immediately
+                saveStudents();
+                buildFingerprintCache();
+                rebuildStudentCache();
+                
+                lastSuccessId = pendingId;
+                
+                lcd.clear();
+                lcd.print("Registered!");
+                lcd.setCursor(0, 1);
+                lcd.print("ID: ");
+                lcd.print(pendingId);
+                
+                Serial.println("鉁� Registration SUCCESS!");
+                Serial.print("   Name: ");
+                Serial.print(pendingName);
+                Serial.print(", ID: ");
+                Serial.println(pendingId);
+                Serial.print("   Total: ");
+                Serial.println(studentCount);
+                
+                delay(3000);
+                
+                // Reset all registration state
+                registrationMode = false;
+                pendingName = "";
+                pendingGrade = "";
+                pendingSection = "";
+                pendingId = 0;
+                registrationStep = 1;
+                
+                lcd.clear();
+                lcd.print("System Ready!");
+                lcd.setCursor(0, 1);
+                lcd.print("Place finger...");
+                return;
+              } else {
+                Serial.println("鉂� Store failed");
+                lcd.clear();
+                lcd.print("Save failed!");
+                lcd.setCursor(0, 1);
+                lcd.print(getErrorMessage(p));
+                delay(2000);
+                
+                // Clean up
+                finger.deleteModel(pendingId);
+                registrationMode = false;
+                lcd.clear();
+                lcd.print("System Ready!");
+                lcd.setCursor(0, 1);
+                lcd.print("Place finger...");
+                return;
+              }
+            } else {
+              Serial.println("鉂� Model creation failed");
+              lcd.clear();
+              if (p == FINGERPRINT_ENROLLMISMATCH) {
+                lcd.print("Fingers don't");
+                lcd.setCursor(0, 1);
+                lcd.print("match! Try again");
+              } else {
+                lcd.print("Failed!");
+                lcd.setCursor(0, 1);
+                lcd.print(getErrorMessage(p));
+              }
+              delay(3000);
+              
+              // Reset to start
+              registrationStep = 1;
+              lcd.clear();
+              lcd.print("Place finger");
+              lcd.setCursor(0, 1);
+              lcd.print("to start over");
+              delay(2000);
+            }
+          } else {
+            Serial.print("鉂� Second conversion failed: ");
+            Serial.println(getErrorMessage(p));
+            lcd.clear();
+            lcd.print("Bad fingerprint");
+            lcd.setCursor(0, 1);
+            lcd.print("Try again");
+            delay(2000);
+          }
+        }
+        break;
+      }
+  }
+}
+
+// ============= SIMPLE RESET REGISTRATION =============
+void resetRegistration() {
+  registrationMode = false;
+  pendingName = "";
+  pendingGrade = "";
+  pendingSection = "";
+  pendingId = 0;
+  registrationStep = 1; // Reset to step 1
+  registrationStartTime = 0;
+  
+  // Don't touch lastSuccessId here
+  
+  Serial.println("馃攧 Registration reset");
+  
+  lcd.clear();
+  lcd.print("System Ready!");
+  lcd.setCursor(0, 1);
+  lcd.print("Place finger...");
+}
+
+// ============= GET ERROR MESSAGE =============
+String getErrorMessage(uint8_t errorCode) {
+  switch(errorCode) {
+    case FINGERPRINT_OK:
+      return "OK";
+    case FINGERPRINT_PACKETRECIEVEERR:
+      return "Communication error";
+    case FINGERPRINT_NOFINGER:
+      return "No finger detected";
+    case FINGERPRINT_IMAGEFAIL:
+      return "Image capture failed";
+    case FINGERPRINT_IMAGEMESS:
+      return "Image too messy";
+    case FINGERPRINT_FEATUREFAIL:
+      return "Feature extraction failed";
+    case FINGERPRINT_NOMATCH:
+      return "No match found";
+    case FINGERPRINT_NOTFOUND:
+      return "Fingerprint not found";
+    case FINGERPRINT_ENROLLMISMATCH:
+      return "Fingers don't match";
+    case FINGERPRINT_BADLOCATION:
+      return "Bad memory location";
+    case FINGERPRINT_DBRANGEFAIL:
+      return "Database range error";
+    case FINGERPRINT_UPLOADFEATUREFAIL:
+      return "Upload feature failed";
+    case FINGERPRINT_PACKETRESPONSEFAIL:
+      return "Packet response failed";
+    case FINGERPRINT_UPLOADFAIL:
+      return "Upload failed";
+    case FINGERPRINT_DELETEFAIL:
+      return "Delete failed";
+    case FINGERPRINT_DBCLEARFAIL:
+      return "Database clear failed";
+    case FINGERPRINT_PASSFAIL:
+      return "Password failed";
+    case FINGERPRINT_INVALIDIMAGE:
+      return "Invalid image";
+    case FINGERPRINT_FLASHERR:
+      return "Flash memory error";
+    default:
+      return "Unknown error: " + String(errorCode);
+  }
+}
+
+// ============= CHECK SENSOR MEMORY =============
+void checkSensorMemory() {
+  Serial.println("\n=== SENSOR MEMORY CHECK ===");
+  finger.getTemplateCount();
+  Serial.print("Templates stored in sensor: ");
+  Serial.println(finger.templateCount);
+  
+  if (finger.templateCount > 0) {
+    Serial.println("Stored IDs:");
+    int found = 0;
+    for (int id = 1; id <= 200 && found < finger.templateCount; id++) {
+      if (finger.loadModel(id) == FINGERPRINT_OK) {
+        Serial.print("  ID: ");
+        Serial.println(id);
+        found++;
+      }
+    }
+  }
+  Serial.println("===========================\n");
+}
+
+void checkSensorCapacity() {
+  finger.getTemplateCount();
+  Serial.print("馃搳 Sensor capacity: ");
+  Serial.print(finger.templateCount);
+  Serial.print("/");
+  Serial.println(MAX_FINGERPRINT_CAPACITY);
+  if (finger.templateCount >= MAX_FINGERPRINT_CAPACITY - 10) {
+    Serial.println("鈿狅笍 WARNING: Sensor almost full!");
+  }
+}
+
+// ============= HELPER FUNCTIONS =============
+void showMainMenu() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready!");
+  lcd.setCursor(0, 1);
+  lcd.print("Place finger...");
+}
+
+String getLocationName(int location) {
+  if (location >= 0 && location < LOCATION_COUNT) {
+    return String(locationNames[location]);
+  }
+  return "Unknown";
+}
+
+void buildFingerprintCache() {
+  memset(fingerprintToStudentId, 0, sizeof(fingerprintToStudentId));
+  for (int i = 0; i < studentCount; i++) {
+    if (students[i].id < 200) {
+      fingerprintToStudentId[students[i].id] = students[i].id;
+    }
+  }
+}
+
+// ============= SIMPLE GET NEXT AVAILABLE ID =============
+int getNextAvailableId() {
+  // Check for gaps in the 1-50 range
+  for (int id = 1; id <= MAX_STUDENTS + 10; id++) {
+    bool foundInDB = false;
+    
+    // Check in database only
+    for (int i = 0; i < studentCount; i++) {
+      if (students[i].id == id) {
+        foundInDB = true;
+        break;
+      }
+    }
+    
+    if (!foundInDB) {
+      Serial.print("鉁� Found available ID: ");
+      Serial.println(id);
+      return id;
+    }
+  }
+  
+  // Fallback
+  int newId = studentCount + 1;
+  Serial.print("鈿狅笍 Using fallback ID: ");
+  Serial.println(newId);
+  return newId;
+}
+
+Student* findStudentById(int id) {
+  for (int i = 0; i < studentCount; i++) {
+    if (students[i].id == id) return &students[i];
+  }
+  return NULL;
+}
+
+bool isCheckedInToday(int studentId) {
+  DateTime now;
+  if (!validateAndFixRTC()) {
+    now = DateTime(F(__DATE__), F(__TIME__));
+  } else {
+    now = rtc.now();
+  }
+  
+  char today[11];
+  safeDateFormat(today, now.year(), now.month(), now.day());
+  
+  for (int i = attendanceCount-1; i >= max(0, attendanceCount-20); i--) {
+    if (attendanceRecords[i].studentId == studentId && 
+        strcmp(attendanceRecords[i].date, today) == 0 &&
+        strlen(attendanceRecords[i].timeOut) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void recordAttendance(int studentId, bool isTimeIn, int location) {
+  DateTime now;
+  if (!validateAndFixRTC()) {
+    now = DateTime(F(__DATE__), F(__TIME__));
+  } else {
+    now = rtc.now();
+  }
+  
+  char timeStr[12];
+  safeTimeFormat(timeStr, now.hour(), now.minute(), now.second());
+  
+  char today[11];
+  safeDateFormat(today, now.year(), now.month(), now.day());
+  
+  if (isTimeIn) {
+    if (attendanceCount < MAX_ATTENDANCE) {
+      int remark = calculateRemark(now, true);
+      
+      attendanceRecords[attendanceCount].studentId = studentId;
+      strcpy(attendanceRecords[attendanceCount].timeIn, timeStr);
+      strcpy(attendanceRecords[attendanceCount].timeOut, "");
+      strcpy(attendanceRecords[attendanceCount].date, today);
+      attendanceRecords[attendanceCount].location = location;
+      attendanceRecords[attendanceCount].isActive = true;
+      attendanceRecords[attendanceCount].remark = remark;
+      attendanceRecords[attendanceCount].duration = 0;
+      attendanceCount++;
+      saveAttendance();
+      Serial.printf("鉁� Time In recorded for ID %d at %s (%s)\n", studentId, locationNames[location], getRemarkText(remark).c_str());
+    }
+  } else {
+    for (int i = attendanceCount-1; i >= max(0, attendanceCount-20); i--) {
+      if (attendanceRecords[i].studentId == studentId && 
+          strlen(attendanceRecords[i].timeOut) == 0) {
+        strcpy(attendanceRecords[i].timeOut, timeStr);
+        attendanceRecords[i].isActive = false;
+        attendanceRecords[i].remark = calculateRemark(now, false);
+        attendanceRecords[i].duration = calculateDuration(attendanceRecords[i].timeIn, attendanceRecords[i].timeOut);
+        saveAttendance();
+        Serial.printf("鉁� Time Out recorded for ID %d at %s (%s)\n", studentId, locationNames[location], getRemarkText(attendanceRecords[i].remark).c_str());
+        break;
+      }
+    }
+  }
+}
+
+// ============= EEPROM FUNCTIONS =============
+void saveStudents() {
+  int addr = STUDENT_COUNT_ADDR;
+  
+  if (studentCount < 0 || studentCount > MAX_STUDENTS) {
+    Serial.println("鉂� Invalid student count, resetting to 0");
+    studentCount = 0;
+  }
+  
+  EEPROM.writeInt(addr, studentCount);
+  addr = STUDENT_DATA_START;
+  
+  Serial.printf("馃捑 Saving %d students to EEPROM\n", studentCount);
+  
+  for (int i = 0; i < studentCount; i++) {
+    EEPROM.writeInt(addr, students[i].id);
+    addr += sizeof(int);
+    
+    EEPROM.writeBytes(addr, students[i].name, 20);
+    addr += 20;
+    
+    EEPROM.writeBytes(addr, students[i].grade, 5);
+    addr += 5;
+    
+    EEPROM.writeBytes(addr, students[i].section, 9);
+    addr += 9;
+    
+    EEPROM.writeBool(addr, students[i].isRegistered);
+    addr += sizeof(bool);
+    
+    int padding = STUDENT_RECORD_SIZE - (sizeof(int) + 20 + 5 + 9 + sizeof(bool));
+    for (int j = 0; j < padding; j++) {
+      EEPROM.write(addr + j, 0);
+    }
+    addr += padding;
+  }
+  
+  if (EEPROM.commit()) {
+    Serial.println("鉁� EEPROM commit successful");
+  } else {
+    Serial.println("鉂� EEPROM commit failed!");
+  }
+}
+
+void loadStudents() {
+  int addr = STUDENT_COUNT_ADDR;
+  studentCount = EEPROM.readInt(addr);
+  
+  Serial.printf("馃搨 Reading student count from EEPROM: %d\n", studentCount);
+  
+  if (studentCount < 0 || studentCount > MAX_STUDENTS) {
+    Serial.printf("鈿狅笍 Invalid student count: %d, resetting to 0\n", studentCount);
+    studentCount = 0;
+    return;
+  }
+  
+  addr = STUDENT_DATA_START;
+  
+  for (int i = 0; i < studentCount; i++) {
+    students[i].id = EEPROM.readInt(addr);
+    addr += sizeof(int);
+    
+    EEPROM.readBytes(addr, students[i].name, 20);
+    students[i].name[19] = '\0';
+    addr += 20;
+    
+    EEPROM.readBytes(addr, students[i].grade, 5);
+    students[i].grade[4] = '\0';
+    addr += 5;
+    
+    EEPROM.readBytes(addr, students[i].section, 9);
+    students[i].section[8] = '\0';
+    addr += 9;
+    
+    students[i].isRegistered = EEPROM.readBool(addr);
+    addr += sizeof(bool);
+    
+    int padding = STUDENT_RECORD_SIZE - (sizeof(int) + 20 + 5 + 9 + sizeof(bool));
+    addr += padding;
+    
+    if (students[i].id < 1 || students[i].id > 1000) {
+      Serial.printf("鈿狅笍 Invalid student ID %d at index %d, stopping load\n", students[i].id, i);
+      studentCount = i;
+      break;
+    }
+  }
+  
+  Serial.printf("馃搨 Successfully loaded %d students from EEPROM\n", studentCount);
+}
+
+void saveAttendance() {
+  int addr = ATTENDANCE_COUNT_ADDR;
+  
+  if (attendanceCount < 0 || attendanceCount > MAX_ATTENDANCE) {
+    attendanceCount = 0;
+  }
+  
+  EEPROM.writeInt(addr, attendanceCount);
+  addr = ATTENDANCE_DATA_START;
+  
+  for (int i = 0; i < attendanceCount; i++) {
+    EEPROM.writeInt(addr, attendanceRecords[i].studentId);
+    addr += sizeof(int);
+    
+    EEPROM.writeBytes(addr, attendanceRecords[i].timeIn, 12);
+    addr += 12;
+    
+    EEPROM.writeBytes(addr, attendanceRecords[i].timeOut, 12);
+    addr += 12;
+    
+    EEPROM.writeBytes(addr, attendanceRecords[i].date, 11);
+    addr += 11;
+    
+    EEPROM.writeInt(addr, attendanceRecords[i].location);
+    addr += sizeof(int);
+    
+    EEPROM.writeBool(addr, attendanceRecords[i].isActive);
+    addr += sizeof(bool);
+    
+    EEPROM.writeInt(addr, attendanceRecords[i].remark);
+    addr += sizeof(int);
+    
+    EEPROM.writeInt(addr, attendanceRecords[i].duration);
+    addr += sizeof(int);
+    
+    int padding = ATTENDANCE_RECORD_SIZE - (sizeof(int) + 12 + 12 + 11 + sizeof(int) + sizeof(bool) + sizeof(int) + sizeof(int));
+    for (int j = 0; j < padding; j++) {
+      EEPROM.write(addr + j, 0);
+    }
+    addr += padding;
+  }
+  
+  EEPROM.commit();
+  Serial.printf("馃捑 Saved %d attendance records\n", attendanceCount);
+}
+
+void loadAttendance() {
+  int addr = ATTENDANCE_COUNT_ADDR;
+  attendanceCount = EEPROM.readInt(addr);
+  
+  if (attendanceCount < 0 || attendanceCount > MAX_ATTENDANCE) {
+    attendanceCount = 0;
+    return;
+  }
+  
+  addr = ATTENDANCE_DATA_START;
+  
+  for (int i = 0; i < attendanceCount; i++) {
+    attendanceRecords[i].studentId = EEPROM.readInt(addr);
+    addr += sizeof(int);
+    
+    EEPROM.readBytes(addr, attendanceRecords[i].timeIn, 12);
+    attendanceRecords[i].timeIn[11] = '\0';
+    addr += 12;
+    
+    EEPROM.readBytes(addr, attendanceRecords[i].timeOut, 12);
+    attendanceRecords[i].timeOut[11] = '\0';
+    addr += 12;
+    
+    EEPROM.readBytes(addr, attendanceRecords[i].date, 11);
+    attendanceRecords[i].date[10] = '\0';
+    addr += 11;
+    
+    attendanceRecords[i].location = EEPROM.readInt(addr);
+    addr += sizeof(int);
+    
+    attendanceRecords[i].isActive = EEPROM.readBool(addr);
+    addr += sizeof(bool);
+    
+    attendanceRecords[i].remark = EEPROM.readInt(addr);
+    addr += sizeof(int);
+    
+    attendanceRecords[i].duration = EEPROM.readInt(addr);
+    addr += sizeof(int);
+    
+    int padding = ATTENDANCE_RECORD_SIZE - (sizeof(int) + 12 + 12 + 11 + sizeof(int) + sizeof(bool) + sizeof(int) + sizeof(int));
+    addr += padding;
+  }
+  
+  Serial.printf("馃搨 Loaded %d attendance records\n", attendanceCount);
+}
